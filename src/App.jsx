@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   LayoutDashboard, MapPin, Wallet, Layers, Users, Calendar as CalendarIcon,
   Receipt, FileBarChart, Plus, Pencil, Trash2, X, Search, ChevronLeft,
@@ -216,6 +216,7 @@ async function loadAllData() {
 
   const students = (studentsRes.data || []).map((s) => ({
     id: s.id, name: s.name, phone: s.phone || "", email: s.email || "", dob: s.dob || "",
+    dateOfJoining: s.date_of_joining || "",
     batchId: s.batch_id || "", locationId: s.location_id, jerseyName: s.jersey_name || "",
     jerseyNo: s.jersey_no || "", sessionsPerWeek: s.sessions_per_week ?? 2,
     attendanceDays: s.attendance_days || [],
@@ -239,6 +240,8 @@ async function loadAllData() {
   const payments = (paymentsRes.data || []).map((p) => ({
     id: p.id, studentId: p.student_id, date: p.date, receiptNo: p.receipt_no,
     amount: p.amount, nextPaymentDate: p.next_payment_date || "", comment: p.comment || "",
+    paymentType: p.payment_type || "Fee", startDate: p.start_date || "", endDate: p.end_date || "",
+    registrationFeeAmount: p.registration_fee_amount ?? "",
   }));
 
   return { locations, paymentPlans, batches, coaches, students, sessions, attendance, payments };
@@ -265,8 +268,9 @@ function studentExpectedFee(data, student) {
 function studentFeeStatus(data, student) {
   const last = latestPayment(data, student.id);
   if (!last) return "Due";
-  if (last.nextPaymentDate && last.nextPaymentDate < todayISO()) return "Overdue";
-  return "Paid";
+  if (!last.nextPaymentDate) return "Due";
+  if (last.nextPaymentDate > todayISO()) return "Paid";
+  return "Due";
 }
 function feeStatusColor(status) {
   if (status === "Paid") return "var(--teal)";
@@ -302,17 +306,19 @@ function feePaidForStudentInMonth(data, studentId, mKey) {
     .filter((p) => p.studentId === studentId && monthKey(p.date) === mKey)
     .reduce((sum, p) => sum + Number(p.amount || 0), 0);
 }
-function computeOutstanding(data, students) {
+function totalPaidInMonth(data, students, mKey) {
+  const ids = new Set(students.map((s) => s.id));
+  return data.payments
+    .filter((p) => ids.has(p.studentId) && monthKey(p.date) === mKey)
+    .reduce((a, p) => a + Number(p.amount || 0) + Number(p.registrationFeeAmount || 0), 0);
+}
+function computeOutstandingInMonth(data, students, mKey) {
   return students.reduce((sum, s) => {
     const expected = studentExpectedFee(data, s);
-    const paid = studentPayments(data, s.id).reduce((a, p) => a + Number(p.amount || 0), 0);
+    const paid = feePaidForStudentInMonth(data, s.id, mKey);
     const due = expected - paid;
     return sum + (due > 0 ? due : 0);
   }, 0);
-}
-function totalPaid(data, students) {
-  const ids = new Set(students.map((s) => s.id));
-  return data.payments.filter((p) => ids.has(p.studentId)).reduce((a, p) => a + Number(p.amount || 0), 0);
 }
 function sessionsTakenCount(data, sessions) {
   return sessions.filter((s) => s.date <= todayISO()).length;
@@ -322,10 +328,10 @@ function monthsElapsedInclusive(fromIso, toIso) {
   const to = parseISO(startOfMonth(toIso));
   return (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth()) + 1;
 }
-function totalOverdueAmountFor(data, student) {
+function totalOverdueAmountFor(data, student, asOf) {
   const feePerCycle = studentExpectedFee(data, student);
   const last = latestPayment(data, student.id);
-  const today = todayISO();
+  const today = asOf || todayISO();
   if (!last || !last.nextPaymentDate) return feePerCycle;
   if (last.nextPaymentDate > today) return 0;
   const plan = studentPlan(data, student);
@@ -345,6 +351,17 @@ function sessionsOverdueCountFor(data, student) {
     .filter((se) => se.locationId === student.locationId && se.date > last.nextPaymentDate && se.date <= todayISO())
     .filter((se) => data.attendance.some((a) => a.sessionId === se.id && a.studentId === student.id && a.status === "P"))
     .length;
+}
+// Until a student has a payment record with a due date, any attended session counts.
+// Once a due date exists, only sessions on or after that date count.
+function hasAttendedSinceDue(data, student) {
+  const cutoff = latestPayment(data, student.id)?.nextPaymentDate;
+  return data.attendance.some((a) => {
+    if (a.studentId !== student.id || a.status !== "P") return false;
+    if (!cutoff) return true;
+    const session = data.sessions.find((se) => se.id === a.sessionId);
+    return session && session.date >= cutoff;
+  });
 }
 function studentsAttendedThisMonthByLocation(data) {
   const mKey = monthKey(todayISO());
@@ -428,6 +445,16 @@ function Field({ label, children }) {
   );
 }
 
+function DateInput({ value, onChange, className = "", min, max }) {
+  const inputRef = useRef(null);
+  return (
+    <div className={`sa-date-input ${className}`} onClick={() => inputRef.current?.showPicker?.()}>
+      <input ref={inputRef} type="date" value={value} onChange={onChange} min={min} max={max} />
+      <span className="sa-date-display">{value ? fmtDate(value) : ""}</span>
+    </div>
+  );
+}
+
 function EmptyState({ icon: Icon, title, message }) {
   return (
     <div className="sa-empty">
@@ -504,7 +531,7 @@ function Topbar({ view, data, locationId, setLocationId, onOpenMobileNav }) {
           <Menu size={20} />
         </button>
         <div>
-          <div className="sa-topbar-eyebrow">Sports Academy</div>
+          <div className="sa-topbar-eyebrow">Soccer Italian Style FA</div>
           <h1 className="sa-topbar-title">{pageLabel}</h1>
         </div>
       </div>
@@ -540,14 +567,15 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
     () => data.coaches.filter((c) => dashLocationId === "ALL" || c.locationIds.includes(dashLocationId)),
     [data.coaches, dashLocationId]
   );
-  const paid = totalPaid(data, scopedStudents);
-  const outstanding = computeOutstanding(data, scopedStudents);
+  const currentMonthKey = monthKey(todayISO());
+  const paid = totalPaidInMonth(data, scopedStudents, currentMonthKey);
+  const outstanding = computeOutstandingInMonth(data, scopedStudents, currentMonthKey);
   const revenue = paid + outstanding;
 
   const attendedByLocationRaw = studentsAttendedThisMonthByLocation(data);
   const combinedByLocation = data.locations.map((l, i) => ({
     name: l.name,
-    income: totalPaid(data, data.students.filter((s) => s.locationId === l.id)),
+    income: totalPaidInMonth(data, data.students.filter((s) => s.locationId === l.id), currentMonthKey),
     attended: attendedByLocationRaw[i]?.attended || 0,
   }));
 
@@ -576,7 +604,7 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
           accent="#7DD3FC"
         />
         <ScoreCard
-          label="Revenue"
+          label="Current Month Revenue"
           value={money(revenue)}
           sub={`${money(paid)} paid \u00b7 ${money(outstanding)} outstanding`}
           icon={Wallet}
@@ -802,7 +830,7 @@ function PaymentPlansPage({ data, refetchData, locationId }) {
         <EmptyState icon={Wallet} title="No payment plans" message="Create a payment plan for this location." />
       ) : (
         <div className="sa-table-wrap">
-          <table className="sa-table">
+          <table className="sa-table sa-table-compact">
             <thead>
               <tr>
                 <th>Plan Name</th><th>Gender</th><th>Duration</th><th>Sessions</th><th>Amount</th><th></th>
@@ -912,7 +940,7 @@ function BatchesPage({ data, refetchData, locationId }) {
         <EmptyState icon={Layers} title="No batches" message="Create a batch for this location." />
       ) : (
         <div className="sa-table-wrap">
-          <table className="sa-table">
+          <table className="sa-table sa-table-compact">
             <thead><tr><th>Batch ID</th><th>Batch Name</th><th>Players</th><th></th></tr></thead>
             <tbody>
               {batches.map((b) => (
@@ -978,7 +1006,12 @@ function StudentForm({ data, locationId, initial, onCancel, onSave }) {
           <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Player name" />
         </Field>
         <Field label="Date of Birth">
-          <input type="date" value={form.dob} onChange={(e) => setForm({ ...form, dob: e.target.value })} />
+          <DateInput value={form.dob} onChange={(e) => setForm({ ...form, dob: e.target.value })} />
+        </Field>
+      </div>
+      <div className="sa-form-row">
+        <Field label="Date of Joining">
+          <DateInput value={form.dateOfJoining} onChange={(e) => setForm({ ...form, dateOfJoining: e.target.value })} />
         </Field>
       </div>
       <div className="sa-form-row">
@@ -1105,7 +1138,7 @@ function StudentDetail({ data, student, onClose }) {
           <p className="sa-muted-text">No payments recorded yet.</p>
         ) : (
           <div className="sa-table-wrap">
-            <table className="sa-table">
+            <table className="sa-table sa-table-compact">
               <thead><tr><th>Date</th><th>Receipt No.</th><th>Amount</th><th>Next Due</th></tr></thead>
               <tbody>
                 {payments.map((p) => (
@@ -1135,7 +1168,7 @@ function StudentsPage({ data, refetchData, locationId }) {
   const [saveError, setSaveError] = useState(null);
 
   const blank = {
-    name: "", phone: "", email: "", dob: "", batchId: "",
+    name: "", phone: "", email: "", dob: "", dateOfJoining: "", batchId: "",
     locationId: locationId === "ALL" ? (data.locations[0]?.id || "") : locationId,
     jerseyName: "", jerseyNo: "", sessionsPerWeek: 0, attendanceDays: [], paymentPlanId: "", overrideFee: "", status: "Active", remark: "",
   };
@@ -1158,6 +1191,7 @@ function StudentsPage({ data, refetchData, locationId }) {
   const save = async (form) => {
     const payload = {
       name: form.name, phone: form.phone, email: form.email, dob: form.dob || null,
+      date_of_joining: form.dateOfJoining || null,
       batch_id: form.batchId || null, location_id: form.locationId,
       jersey_name: form.jerseyName, jersey_no: form.jerseyNo,
       sessions_per_week: form.attendanceDays.length, attendance_days: form.attendanceDays,
@@ -1195,7 +1229,7 @@ function StudentsPage({ data, refetchData, locationId }) {
 
       <div className="sa-page-actions">
         <div className="sa-search-row">
-          <div className="sa-search-box">
+          <div className="sa-search-box" style={{ minWidth: "min(420px, 100%)" }}>
             <Search size={15} />
             <input placeholder="Search by name, jersey name, or jersey no." value={search} onChange={(e) => setSearch(e.target.value)} />
           </div>
@@ -1210,7 +1244,7 @@ function StudentsPage({ data, refetchData, locationId }) {
         <EmptyState icon={UserRound} title="No players found" message="Try adjusting filters or add a new player." />
       ) : (
         <div className="sa-table-wrap">
-          <table className="sa-table">
+          <table className="sa-table sa-table-compact">
             <thead>
               <tr>
                 <th>Name</th><th>Jersey Name</th><th>Jersey No.</th><th>Batch</th><th>Phone No.</th><th>Fee Status</th><th>Location</th><th></th>
@@ -1280,45 +1314,82 @@ function AttendancePage({ data, refetchData, locationId }) {
   const [search, setSearch] = useState("");
   const [batchFilter, setBatchFilter] = useState("ALL");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [attendanceFilter, setAttendanceFilter] = useState("All");
   const [saveError, setSaveError] = useState(null);
+  const [pendingStatus, setPendingStatus] = useState({});
+  const pendingStatusRef = useRef({});
 
   const batchOptions = data.batches.filter((b) => locationId === "ALL" || b.locationId === locationId);
-
-  const students = data.students.filter((s) => {
-    if (locationId !== "ALL" && s.locationId !== locationId) return false;
-    if (batchFilter !== "ALL" && s.batchId !== batchFilter) return false;
-    if (statusFilter !== "All" && s.status !== statusFilter) return false;
-    const q = search.trim().toLowerCase();
-    if (!q) return true;
-    return s.name.toLowerCase().includes(q) || String(s.jerseyNo).toLowerCase().includes(q);
-  });
 
   const sessionFor = (student) =>
     data.sessions.find((s) => s.locationId === student.locationId && s.date === date && s.batchId === student.batchId);
 
   const statusFor = (student) => {
+    if (Object.prototype.hasOwnProperty.call(pendingStatus, student.id)) return pendingStatus[student.id];
     const session = sessionFor(student);
     if (!session) return null;
     const rec = data.attendance.find((a) => a.sessionId === session.id && a.studentId === student.id);
     return rec ? rec.status : null;
   };
 
+  const students = data.students.filter((s) => {
+    if (locationId !== "ALL" && s.locationId !== locationId) return false;
+    if (batchFilter !== "ALL" && s.batchId !== batchFilter) return false;
+    if (statusFilter !== "All" && s.status !== statusFilter) return false;
+    if (attendanceFilter !== "All") {
+      const att = statusFor(s);
+      if (attendanceFilter === "Present" && att !== "P") return false;
+      if (attendanceFilter === "Absent" && att !== "A") return false;
+      if (attendanceFilter === "NotMarked" && att) return false;
+    }
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return s.name.toLowerCase().includes(q) || (s.jerseyName || "").toLowerCase().includes(q) || String(s.jerseyNo).toLowerCase().includes(q);
+  });
+
+  const clearPendingIfCurrent = (studentId, status) => {
+    if (pendingStatusRef.current[studentId] !== status) return;
+    const next = { ...pendingStatusRef.current };
+    delete next[studentId];
+    pendingStatusRef.current = next;
+    setPendingStatus(next);
+  };
+
   const markStatus = async (student, status) => {
+    pendingStatusRef.current = { ...pendingStatusRef.current, [student.id]: status };
+    setPendingStatus(pendingStatusRef.current);
+
     let session = data.sessions.find((s) => s.locationId === student.locationId && s.date === date && s.batchId === student.batchId);
     let sessionId = session?.id;
     if (!sessionId) {
       const { data: created, error } = await supabase.from("sessions").insert({
         location_id: student.locationId, batch_id: student.batchId, date, start_time: "00:00", end_time: "00:00",
       }).select().single();
-      if (error) { setSaveError(error.message); return; }
+      if (error) {
+        setSaveError(error.message);
+        clearPendingIfCurrent(student.id, status);
+        return;
+      }
       sessionId = created.id;
     }
+
+    // A newer click for this student has already taken over — let that call own the write.
+    if (pendingStatusRef.current[student.id] !== status) return;
+
     const { error } = await supabase
       .from("attendance")
       .upsert({ session_id: sessionId, student_id: student.id, status }, { onConflict: "session_id,student_id" });
-    if (error) { setSaveError(error.message); return; }
+    if (error) {
+      setSaveError(error.message);
+      clearPendingIfCurrent(student.id, status);
+      return;
+    }
     setSaveError(null);
+
+    if (pendingStatusRef.current[student.id] !== status) return;
+
     await refetchData();
+    clearPendingIfCurrent(student.id, status);
   };
 
   const presentCount = students.filter((s) => statusFor(s) === "P").length;
@@ -1328,9 +1399,9 @@ function AttendancePage({ data, refetchData, locationId }) {
       {saveError && <div className="sa-storage-warning"><AlertCircle size={14} /> {saveError}</div>}
       <div className="sa-page-actions">
         <div className="sa-search-row">
-          <div className="sa-search-box">
+          <div className="sa-search-box" style={{ minWidth: "min(420px, 100%)" }}>
             <Search size={15} />
-            <input placeholder="Search by name or jersey no." value={search} onChange={(e) => setSearch(e.target.value)} />
+            <input placeholder="Search by name, jersey name, or jersey no." value={search} onChange={(e) => setSearch(e.target.value)} />
           </div>
           <select className="sa-inline-select" value={batchFilter} onChange={(e) => setBatchFilter(e.target.value)}>
             <option value="ALL">All Batches</option>
@@ -1339,8 +1410,14 @@ function AttendancePage({ data, refetchData, locationId }) {
           <select className="sa-inline-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
             <option>All</option><option>Active</option><option>Inactive</option>
           </select>
+          <select className="sa-inline-select" value={attendanceFilter} onChange={(e) => setAttendanceFilter(e.target.value)}>
+            <option value="All">All Attendance</option>
+            <option value="Present">Present</option>
+            <option value="Absent">Absent</option>
+            <option value="NotMarked">Not Marked</option>
+          </select>
+          <DateInput className="sa-inline-select sa-att-date" value={date} onChange={(e) => setDate(e.target.value)} />
         </div>
-        <input type="date" className="sa-inline-select" value={date} onChange={(e) => setDate(e.target.value)} />
       </div>
 
       <div className="sa-scoreboard">
@@ -1350,28 +1427,42 @@ function AttendancePage({ data, refetchData, locationId }) {
       {students.length === 0 ? (
         <EmptyState icon={ClipboardList} title="No players found" message="Try adjusting filters." />
       ) : (
-        <div className="sa-table-wrap">
-          <table className="sa-table">
+        <div className="sa-table-wrap sa-attendance-scroll">
+          <table className="sa-table sa-table-compact sa-attendance-table">
             <thead>
               <tr>
-                <th>Name</th><th>Jersey Name</th><th>Jersey No.</th><th>Batch</th>
-                <th className="sa-th-center">Present</th><th className="sa-th-center">Absent</th>
+                <th className="sa-col-name">Name</th><th>Jersey Name</th><th>Jersey No.</th><th>Fee Due</th><th>Batch</th>
+                <th className="sa-th-center">Attendance</th>
               </tr>
             </thead>
             <tbody>
               {students.map((s) => {
                 const status = statusFor(s);
+                const feeStatus = studentFeeStatus(data, s);
                 return (
                   <tr key={s.id}>
-                    <td className="sa-td-strong">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</td>
+                    <td className="sa-td-strong sa-col-name">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</td>
                     <td>{s.jerseyName || "\u2014"}</td>
                     <td>#{s.jerseyNo}</td>
+                    <td><Pill tone={feeStatus === "Paid" ? "teal" : feeStatus === "Overdue" ? "red" : "amber"}>{feeStatus}</Pill></td>
                     <td>{batchName(data, s.batchId)}</td>
                     <td className="sa-th-center">
-                      <button className={`sa-att-btn sa-att-btn-wide ${status === "P" ? "sa-att-btn-p" : ""}`} onClick={() => markStatus(s, "P")}>Present</button>
-                    </td>
-                    <td className="sa-th-center">
-                      <button className={`sa-att-btn sa-att-btn-wide ${status === "A" ? "sa-att-btn-a" : ""}`} onClick={() => markStatus(s, "A")}>Absent</button>
+                      <div className="sa-att-toggle">
+                        <button
+                          className={`sa-att-toggle-btn sa-att-toggle-p ${status === "P" ? "sa-att-toggle-active" : ""}`}
+                          onClick={() => markStatus(s, "P")}
+                          aria-label={`Mark ${s.name} present`}
+                        >
+                          <Check size={15} strokeWidth={3} />
+                        </button>
+                        <button
+                          className={`sa-att-toggle-btn sa-att-toggle-a ${status === "A" ? "sa-att-toggle-active" : ""}`}
+                          onClick={() => markStatus(s, "A")}
+                          aria-label={`Mark ${s.name} absent`}
+                        >
+                          <X size={15} strokeWidth={3} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -1526,12 +1617,12 @@ function CoachesPage({ data, refetchData, locationId }) {
             <p className="sa-muted-text">No sessions assigned yet.</p>
           ) : (
             <div className="sa-table-wrap">
-              <table className="sa-table">
+              <table className="sa-table sa-table-compact">
                 <thead><tr><th>Date</th><th>Time</th><th>Batch</th><th>Location</th></tr></thead>
                 <tbody>
                   {coachSessions.map((s) => (
                     <tr key={s.id}>
-                      <td>{fmtDate(s.date)}</td><td>{s.startTime}\u2013{s.endTime}</td><td>{batchName(data, s.batchId)}</td><td>{locationName(data, s.locationId)}</td>
+                      <td>{fmtDate(s.date)}</td><td>{s.startTime}{"\u2013"}{s.endTime}</td><td>{batchName(data, s.batchId)}</td><td>{locationName(data, s.locationId)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1562,7 +1653,7 @@ function SessionForm({ data, locationId, date, initial, onCancel, onSave }) {
   };
   return (
     <div className="sa-form">
-      <Field label="Date"><input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
+      <Field label="Date"><DateInput value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
       <div className="sa-form-row">
         <Field label="Start Time"><input type="time" value={form.startTime} onChange={(e) => setForm({ ...form, startTime: e.target.value })} /></Field>
         <Field label="End Time"><input type="time" value={form.endTime} onChange={(e) => setForm({ ...form, endTime: e.target.value })} /></Field>
@@ -1637,8 +1728,8 @@ function BulkSessionForm({ data, locationId, onCancel, onCreate }) {
   return (
     <div className="sa-form">
       <div className="sa-form-row">
-        <Field label="From Date"><input type="date" value={form.fromDate} onChange={(e) => setForm({ ...form, fromDate: e.target.value })} /></Field>
-        <Field label="To Date"><input type="date" value={form.toDate} onChange={(e) => setForm({ ...form, toDate: e.target.value })} /></Field>
+        <Field label="From Date"><DateInput value={form.fromDate} onChange={(e) => setForm({ ...form, fromDate: e.target.value })} /></Field>
+        <Field label="To Date"><DateInput value={form.toDate} onChange={(e) => setForm({ ...form, toDate: e.target.value })} /></Field>
       </div>
       <div className="sa-form-row">
         <Field label="Start Time"><input type="time" value={form.startTime} onChange={(e) => setForm({ ...form, startTime: e.target.value })} /></Field>
@@ -1869,7 +1960,7 @@ function SchedulesPage({ data, refetchData, locationId }) {
 
       <div className="sa-day-panel">
         <div className="sa-day-panel-head">
-          <h3>{parseISO(selectedDay).toLocaleDateString("en-US", { weekday: "long", day: "numeric", month: "long" })}</h3>
+          <h3>{fmtDate(selectedDay)}</h3>
           <button className="sa-btn sa-btn-primary sa-btn-sm" onClick={() => setSessionModal({ mode: "add" })}><Plus size={14} /> Add Session</button>
         </div>
         {daySessions.length === 0 ? (
@@ -1928,24 +2019,51 @@ function SchedulesPage({ data, refetchData, locationId }) {
 
 /* ============================== FEE UPDATE ============================== */
 
+const PAYMENT_TYPES = ["Fee", "Extra Jersey", "Full Kit"];
+
 function RecordPaymentForm({ initial, onCancel, onSave }) {
-  const [form, setForm] = useState(initial || { date: todayISO(), receiptNo: "", amount: "", nextPaymentDate: addDays(todayISO(), 30), comment: "" });
+  const [form, setForm] = useState(initial || {
+    paymentType: "Fee", date: todayISO(), receiptNo: "", amount: "", nextPaymentDate: addDays(todayISO(), 30),
+    startDate: "", endDate: "", registrationFeeAmount: "", comment: "",
+  });
+  const isFee = form.paymentType === "Fee";
+  const canSave = form.paymentType && form.amount !== "" && form.receiptNo.trim();
   return (
     <div className="sa-form">
+      <Field label="Payment Type">
+        <select value={form.paymentType} onChange={(e) => setForm({ ...form, paymentType: e.target.value })}>
+          {PAYMENT_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+      </Field>
+
       <div className="sa-form-row">
-        <Field label="Payment Date"><input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
+        <Field label="Payment Date"><DateInput value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
         <Field label="Receipt No."><input value={form.receiptNo} onChange={(e) => setForm({ ...form, receiptNo: e.target.value })} placeholder="RC-1000" /></Field>
       </div>
-      <div className="sa-form-row">
+
+      {isFee ? (
+        <>
+          <div className="sa-form-row">
+            <Field label="Start Date"><DateInput value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} /></Field>
+            <Field label="End Date"><DateInput value={form.endDate} onChange={(e) => setForm({ ...form, endDate: e.target.value })} /></Field>
+          </div>
+          <div className="sa-form-row">
+            <Field label="Next Payment Date"><DateInput value={form.nextPaymentDate} onChange={(e) => setForm({ ...form, nextPaymentDate: e.target.value })} /></Field>
+            <Field label={`Registration Fee Amount (${CURRENCY})`}><input type="number" min="0" value={form.registrationFeeAmount} onChange={(e) => setForm({ ...form, registrationFeeAmount: e.target.value })} /></Field>
+          </div>
+          <Field label={`Session Fee Amount (${CURRENCY})`}><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
+        </>
+      ) : (
         <Field label={`Payment Amount (${CURRENCY})`}><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
-        <Field label="Next Payment Date"><input type="date" value={form.nextPaymentDate} onChange={(e) => setForm({ ...form, nextPaymentDate: e.target.value })} /></Field>
-      </div>
+      )}
+
       <Field label="Comments (optional)">
         <textarea rows={2} value={form.comment || ""} onChange={(e) => setForm({ ...form, comment: e.target.value })} placeholder="Any note about this payment" />
       </Field>
+
       <div className="sa-form-actions">
         <button className="sa-btn sa-btn-ghost" onClick={onCancel}>Cancel</button>
-        <button className="sa-btn sa-btn-primary" onClick={() => { if (form.amount !== "" && form.receiptNo.trim()) onSave(form); }}>{initial ? "Save Changes" : "Record Payment"}</button>
+        <button className="sa-btn sa-btn-primary" disabled={!canSave} onClick={() => { if (canSave) onSave(form); }}>{initial ? "Save Changes" : "Record Payment"}</button>
       </div>
     </div>
   );
@@ -1955,7 +2073,8 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [payModal, setPayModal] = useState(false);
-  const [showBulk, setShowBulk] = useState(true);
+  const [showBulk, setShowBulk] = useState(false);
+  const [showPaid, setShowPaid] = useState(false);
   const [editingPayment, setEditingPayment] = useState(null);
   const [viewCommentPayment, setViewCommentPayment] = useState(null);
   const [saveError, setSaveError] = useState(null);
@@ -1970,9 +2089,13 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
   const sessionsSinceNextDue = selected ? sessionsOverdueCountFor(data, selected) : 0;
 
   const recordPayment = async (form) => {
+    const isFee = form.paymentType === "Fee";
     const { error } = await supabase.from("payments").insert({
       student_id: selected.id, date: form.date, receipt_no: form.receiptNo,
-      amount: Number(form.amount), next_payment_date: form.nextPaymentDate || null, comment: form.comment || null,
+      amount: Number(form.amount), next_payment_date: isFee ? (form.nextPaymentDate || null) : null,
+      comment: form.comment || null, payment_type: form.paymentType,
+      start_date: isFee ? (form.startDate || null) : null, end_date: isFee ? (form.endDate || null) : null,
+      registration_fee_amount: isFee && form.registrationFeeAmount !== "" ? Number(form.registrationFeeAmount) : null,
     });
     if (error) { setSaveError(error.message); return; }
     setSaveError(null);
@@ -1981,11 +2104,15 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
   };
 
   const updateLastPayment = async (form) => {
+    const isFee = form.paymentType === "Fee";
     const { error } = await supabase
       .from("payments")
       .update({
         date: form.date, receipt_no: form.receiptNo, amount: Number(form.amount),
-        next_payment_date: form.nextPaymentDate || null, comment: form.comment || null,
+        next_payment_date: isFee ? (form.nextPaymentDate || null) : null,
+        comment: form.comment || null, payment_type: form.paymentType,
+        start_date: isFee ? (form.startDate || null) : null, end_date: isFee ? (form.endDate || null) : null,
+        registration_fee_amount: isFee && form.registrationFeeAmount !== "" ? Number(form.registrationFeeAmount) : null,
       })
       .eq("id", editingPayment.payment.id);
     if (error) { setSaveError(error.message); return; }
@@ -1996,7 +2123,8 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
 
   const pendingStudents = students
     .filter((s) => studentFeeStatus(data, s) !== "Paid")
-    .map((s) => ({ s, status: studentFeeStatus(data, s), last: latestPayment(data, s.id), sessionsOverdue: sessionsOverdueCountFor(data, s) }));
+    .map((s) => ({ s, status: studentFeeStatus(data, s), last: latestPayment(data, s.id), sessionsOverdue: sessionsOverdueCountFor(data, s) }))
+    .filter(({ s }) => s.status === "Active" || hasAttendedSinceDue(data, s));
 
   const paidStudents = students
     .filter((s) => studentFeeStatus(data, s) === "Paid")
@@ -2016,7 +2144,7 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
             {matches.map((s) => (
               <div key={s.id} className="sa-search-result-row" onClick={() => { setSelectedId(s.id); setSearch(""); }}>
                 <JerseyBadge no={s.jerseyNo} size={28} />
-                <div><strong>{s.name}</strong><span> \u00b7 {batchName(data, s.batchId)}</span></div>
+                <div><strong>{s.name}</strong><span> {"\u00b7"} {batchName(data, s.batchId)}</span></div>
               </div>
             ))}
           </div>
@@ -2046,15 +2174,22 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
             <p className="sa-muted-text">No payments recorded yet.</p>
           ) : (
             <div className="sa-table-wrap">
-              <table className="sa-table">
-                <thead><tr><th>Date</th><th>Receipt No.</th><th>Amount</th><th>Next Due</th><th></th></tr></thead>
+              <table className="sa-table sa-table-compact">
+                <thead><tr><th>Date</th><th>Receipt No.</th><th>Amount</th><th>Next Due</th><th></th><th></th></tr></thead>
                 <tbody>
-                  {studentPayments(data, selected.id).map((p) => (
+                  {studentPayments(data, selected.id).map((p, i) => (
                     <tr key={p.id}>
                       <td>{fmtDate(p.date)}</td><td className="sa-mono">{p.receiptNo}</td><td className="sa-mono">{money(p.amount)}</td><td>{fmtDate(p.nextPaymentDate)}</td>
                       <td>
                         {p.comment && p.comment.trim() ? (
                           <button className="sa-icon-btn" title="View comment" onClick={() => setViewCommentPayment(p)}><MessageSquare size={14} /></button>
+                        ) : (
+                          <span className="sa-icon-btn-placeholder" />
+                        )}
+                      </td>
+                      <td>
+                        {i === 0 ? (
+                          <button className="sa-icon-btn" title="Edit latest payment" onClick={() => setEditingPayment({ student: selected, payment: p })}><Pencil size={14} /></button>
                         ) : (
                           <span className="sa-icon-btn-placeholder" />
                         )}
@@ -2078,7 +2213,7 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
             <p className="sa-muted-text">Everyone at this location is paid up.</p>
           ) : (
             <div className="sa-table-wrap">
-              <table className="sa-table">
+              <table className="sa-table sa-table-compact">
                 <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Batch</th><th>Status</th><th>Next Due</th><th>Amount Due</th><th>No. of Sessions Overdue</th></tr></thead>
                 <tbody>
                   {pendingStudents.map(({ s, status, last, sessionsOverdue }) => (
@@ -2103,31 +2238,34 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
       <div className="sa-card" style={{ marginTop: 16 }}>
         <div className="sa-card-header">
           <h3>Paid Fees</h3>
+          <button className="sa-icon-btn" onClick={() => setShowPaid(!showPaid)}>{showPaid ? "Hide" : "Show"}</button>
         </div>
-        {paidStudents.length === 0 ? (
-          <p className="sa-muted-text">No paid players at this location yet.</p>
-        ) : (
-          <div className="sa-table-wrap">
-            <table className="sa-table">
-              <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Batch</th><th>Amount Paid</th><th>Receipt No.</th><th>Next Due</th><th></th></tr></thead>
-              <tbody>
-                {paidStudents.map(({ s, last }) => (
-                  <tr key={s.id}>
-                    <td className="sa-td-strong">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</td>
-                    <td>{s.jerseyName || "\u2014"}</td>
-                    <td>#{s.jerseyNo}</td>
-                    <td>{batchName(data, s.batchId)}</td>
-                    <td className="sa-mono">{money(last?.amount)}</td>
-                    <td className="sa-mono">{last?.receiptNo}</td>
-                    <td>{fmtDate(last?.nextPaymentDate)}</td>
-                    <td className="sa-td-actions">
-                      <button className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => setEditingPayment({ student: s, payment: last })}><Pencil size={14} /> Update</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        {showPaid && (
+          paidStudents.length === 0 ? (
+            <p className="sa-muted-text">No paid players at this location yet.</p>
+          ) : (
+            <div className="sa-table-wrap">
+              <table className="sa-table sa-table-compact">
+                <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Batch</th><th>Amount Paid</th><th>Receipt No.</th><th>Next Due</th><th></th></tr></thead>
+                <tbody>
+                  {paidStudents.map(({ s, last }) => (
+                    <tr key={s.id}>
+                      <td className="sa-td-strong">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</td>
+                      <td>{s.jerseyName || "\u2014"}</td>
+                      <td>#{s.jerseyNo}</td>
+                      <td>{batchName(data, s.batchId)}</td>
+                      <td className="sa-mono">{money(last?.amount)}</td>
+                      <td className="sa-mono">{last?.receiptNo}</td>
+                      <td>{fmtDate(last?.nextPaymentDate)}</td>
+                      <td className="sa-td-actions">
+                        <button className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => setEditingPayment({ student: s, payment: last })}><Pencil size={14} /> Update</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
         )}
       </div>
 
@@ -2141,10 +2279,14 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
         <Modal title={`Update Last Payment \u2014 ${editingPayment.student.name}`} onClose={() => setEditingPayment(null)}>
           <RecordPaymentForm
             initial={{
+              paymentType: editingPayment.payment.paymentType || "Fee",
               date: editingPayment.payment.date,
               receiptNo: editingPayment.payment.receiptNo,
               amount: editingPayment.payment.amount,
               nextPaymentDate: editingPayment.payment.nextPaymentDate,
+              startDate: editingPayment.payment.startDate || "",
+              endDate: editingPayment.payment.endDate || "",
+              registrationFeeAmount: editingPayment.payment.registrationFeeAmount ?? "",
               comment: editingPayment.payment.comment || "",
             }}
             onCancel={() => setEditingPayment(null)}
@@ -2211,8 +2353,8 @@ function ReportStudentSummary({ data }) {
             <option>All</option><option>Active</option><option>Inactive</option>
           </select>
         </Field>
-        <Field label="From"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
-        <Field label="To"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
+        <Field label="From"><DateInput value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
+        <Field label="To"><DateInput value={to} onChange={(e) => setTo(e.target.value)} /></Field>
         <button className="sa-btn sa-btn-primary sa-btn-sm" onClick={exportExcel}><Download size={14} /> Export to Excel</button>
       </div>
       <div className="sa-table-wrap">
@@ -2309,8 +2451,8 @@ function ReportAttendance({ data }) {
             <option>All</option><option>Active</option><option>Inactive</option>
           </select>
         </Field>
-        <Field label="From"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
-        <Field label="To"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
+        <Field label="From"><DateInput value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
+        <Field label="To"><DateInput value={to} onChange={(e) => setTo(e.target.value)} /></Field>
         <button className="sa-btn sa-btn-primary sa-btn-sm" onClick={exportExcel}><Download size={14} /> Export to Excel</button>
       </div>
 
@@ -2374,10 +2516,13 @@ function ReportFeeList({ data }) {
   const students = statusFilter === "All" ? searchedStudents : searchedStudents.filter((s) => s.status === statusFilter);
   const rowFor = (s) => {
     const monthPayments = data.payments.filter((p) => p.studentId === s.id && monthKey(p.date) === month);
-    const paid = monthPayments.length > 0;
-    const amountPaid = monthPayments.reduce((a, p) => a + Number(p.amount), 0);
-    const last = monthPayments.sort((a, b) => (a.date < b.date ? 1 : -1))[0] || latestPayment(data, s.id);
-    const dueAmount = paid ? 0 : studentExpectedFee(data, s) - studentPayments(data, s.id).reduce((a, p) => a + Number(p.amount), 0);
+    const coveringPayment = studentPayments(data, s.id).find((p) => p.endDate && monthKey(p.endDate) === month);
+    const amountPaid = monthPayments.length > 0
+      ? monthPayments.reduce((a, p) => a + Number(p.amount), 0)
+      : Number(coveringPayment?.amount || 0);
+    const last = monthPayments.sort((a, b) => (a.date < b.date ? 1 : -1))[0] || coveringPayment || latestPayment(data, s.id);
+    const paid = studentFeeStatus(data, s) === "Paid";
+    const dueAmount = paid ? 0 : studentExpectedFee(data, s);
     return { s, paid, amountPaid, receiptNo: last?.receiptNo || "\u2014", nextDue: last?.nextPaymentDate, dueAmount: Math.max(dueAmount, 0) };
   };
   const rows = students.map(rowFor);
@@ -2408,7 +2553,7 @@ function ReportFeeList({ data }) {
         <button className="sa-btn sa-btn-primary sa-btn-sm" onClick={exportExcel}><Download size={14} /> Export to Excel</button>
       </div>
       <div className="sa-table-wrap">
-        <table className="sa-table">
+        <table className="sa-table sa-table-compact">
           <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Contact</th><th>Player Status</th><th>Status</th><th>Amount Paid</th><th>Receipt No.</th><th>Next Due</th><th>Due Amount</th></tr></thead>
           <tbody>
             {rows.map(({ s, paid, amountPaid, receiptNo, nextDue, dueAmount }) => (
@@ -2447,11 +2592,10 @@ function ReportPendingFee({ data }) {
   const rows = students
     .map((s) => {
       const last = latestPayment(data, s.id);
-      const overdue = !last || (last.nextPaymentDate && last.nextPaymentDate < asOf);
-      const paidTotal = studentPayments(data, s.id).reduce((a, p) => a + Number(p.amount), 0);
-      const dueAmount = Math.max(studentExpectedFee(data, s) - paidTotal, 0);
+      const overdue = !last || !last.nextPaymentDate || last.nextPaymentDate <= asOf;
+      const dueAmount = totalOverdueAmountFor(data, s, asOf);
       const sessionsAfterDue = last
-        ? data.sessions.filter((se) => se.locationId === locationId && se.date > last.nextPaymentDate && se.date <= asOf)
+        ? data.sessions.filter((se) => se.locationId === locationId && se.date >= last.nextPaymentDate && se.date <= asOf)
             .filter((se) => data.attendance.some((a) => a.sessionId === se.id && a.studentId === s.id && a.status === "P")).length
         : 0;
       return { s, overdue, last, dueAmount, sessionsAfterDue };
@@ -2459,7 +2603,7 @@ function ReportPendingFee({ data }) {
     .filter((r) => r.overdue);
 
   const exportExcel = () => {
-    const headers = ["Player Name", "Jersey Name", "Jersey No.", "Contact", "Player Status", "Status", "Amount Paid", "Receipt No.", "Next Payment Date", "Due Amount", "Sessions Attended After Due"];
+    const headers = ["Player Name", "Jersey Name", "Jersey No.", "Contact", "Player Status", "Status", "Amount Paid", "Receipt No.", "Next Payment Date", "Due Amount", "No. of sessions(pending payment)"];
     const data_ = rows.map((r) => [r.s.name, r.s.jerseyName, r.s.jerseyNo, r.s.phone, r.s.status, "Unpaid", r.last ? r.last.amount : 0, r.last?.receiptNo || "\u2014", fmtDate(r.last?.nextPaymentDate), r.dueAmount, r.sessionsAfterDue]);
     downloadXLSX(`pending-fees-${asOf}.xlsx`, headers, data_);
   };
@@ -2480,15 +2624,15 @@ function ReportPendingFee({ data }) {
             <option>All</option><option>Active</option><option>Inactive</option>
           </select>
         </Field>
-        <Field label="As Of Date"><input type="date" value={asOf} onChange={(e) => setAsOf(e.target.value)} /></Field>
+        <Field label="As Of Date"><DateInput value={asOf} onChange={(e) => setAsOf(e.target.value)} /></Field>
         <button className="sa-btn sa-btn-primary sa-btn-sm" onClick={exportExcel}><Download size={14} /> Export to Excel</button>
       </div>
       {rows.length === 0 ? (
         <p className="sa-muted-text">No pending fees for this location as of {fmtDate(asOf)}.</p>
       ) : (
         <div className="sa-table-wrap">
-          <table className="sa-table">
-            <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Contact</th><th>Player Status</th><th>Due Amount</th><th>Receipt No.</th><th>Next Due</th><th>Sessions Attended After Due</th></tr></thead>
+          <table className="sa-table sa-table-compact">
+            <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Contact</th><th>Player Status</th><th>Due Amount</th><th>Receipt No.</th><th>Next Due</th><th>No. of sessions(pending payment)</th></tr></thead>
             <tbody>
               {rows.map(({ s, last, dueAmount, sessionsAfterDue }) => (
                 <tr key={s.id} className="sa-row-unpaid">
@@ -2699,7 +2843,7 @@ function ManageAdminsPage({ currentRole }) {
         <EmptyState icon={ShieldCheck} title="No admins yet" message="Invite your first admin to get started." />
       ) : (
         <div className="sa-table-wrap">
-          <table className="sa-table">
+          <table className="sa-table sa-table-compact">
             <thead>
               <tr><th>Name</th><th>Role</th><th>Assigned Locations</th><th>Status</th><th></th></tr>
             </thead>
@@ -2900,6 +3044,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Number inputs change value on scroll when focused, which is easy to trigger by
+    // accident while scrolling the page — blur before the browser applies the scroll delta.
+    const onWheel = (e) => {
+      if (document.activeElement?.tagName === "INPUT" && document.activeElement.type === "number") {
+        document.activeElement.blur();
+      }
+    };
+    document.addEventListener("wheel", onWheel, { passive: true });
+    return () => document.removeEventListener("wheel", onWheel);
+  }, []);
+
+  useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => setSession(session));
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
@@ -2907,13 +3063,22 @@ export default function App() {
     return () => listener.subscription.unsubscribe();
   }, []);
 
+  const profileFetchedForUserId = useRef(null);
+
   useEffect(() => {
     if (session === undefined) return;
     if (!session) {
+      profileFetchedForUserId.current = null;
       setAdminProfile(null);
       setProfileLoaded(true);
       return;
     }
+    // Supabase re-emits auth state (e.g. token refresh) whenever the tab regains
+    // focus/visibility. That's not a new sign-in, so skip re-fetching/reloading
+    // for the same user — otherwise every tab switch flashes the loading screen,
+    // unmounts the app (closing any open modal), and refetches all data.
+    if (profileFetchedForUserId.current === session.user.id) return;
+    profileFetchedForUserId.current = session.user.id;
     setProfileLoaded(false);
     setProfileError(null);
     let cancelled = false;
@@ -2969,7 +3134,7 @@ export default function App() {
         <style>{STYLES}</style>
         <div className="sa-loading">
           <div className="sa-loading-mark">SA</div>
-          <span>Loading\u2026</span>
+          <span>{"Loading\u2026"}</span>
         </div>
       </div>
     );
@@ -3144,38 +3309,38 @@ const STYLES = `
 /* ---------- Topbar / Main ---------- */
 .sa-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .sa-topbar {
-  display: flex; align-items: center; justify-content: space-between; padding: 22px 32px;
+  display: flex; align-items: center; justify-content: space-between; padding: 14px 28px;
   background: var(--card); border-bottom: 1px solid var(--border);
 }
-.sa-topbar-left { display: flex; align-items: center; gap: 14px; }
-.sa-topbar-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--amber); margin-bottom: 2px; }
-.sa-topbar-title { font-family: 'Oswald', sans-serif; font-size: 24px; font-weight: 600; letter-spacing: 0.3px; }
+.sa-topbar-left { display: flex; align-items: center; gap: 12px; }
+.sa-topbar-eyebrow { font-size: 14px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; color: var(--amber); margin-bottom: 2px; }
+.sa-topbar-title { font-family: 'Oswald', sans-serif; font-size: 19px; font-weight: 600; letter-spacing: 0.3px; }
 .sa-location-select {
   display: flex; align-items: center; gap: 8px; background: var(--bg); border: 1px solid var(--border);
-  border-radius: 8px; padding: 8px 12px; color: var(--navy);
+  border-radius: 8px; padding: 6px 10px; color: var(--navy);
 }
-.sa-location-select select { border: none; background: none; font-family: 'Inter'; font-size: 13.5px; font-weight: 600; color: var(--ink); outline: none; }
-.sa-content { padding: 28px 32px 48px; flex: 1; overflow-y: auto; }
+.sa-location-select select { border: none; background: none; font-family: 'Inter'; font-size: 13px; font-weight: 600; color: var(--ink); outline: none; }
+.sa-content { padding: 20px 28px 36px; flex: 1; overflow-y: auto; }
 .sa-storage-warning {
   display: flex; align-items: center; gap: 8px; background: #FFF7ED; color: #C2410C; border: 1px solid #FED7AA;
   padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px;
 }
-.sa-page { display: flex; flex-direction: column; gap: 20px; }
+.sa-page { display: flex; flex-direction: column; gap: 14px; }
 
 /* ---------- Scoreboard ---------- */
-.sa-scoreboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+.sa-scoreboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .sa-scorecard {
-  background: var(--navy); border-radius: 12px; padding: 18px 20px; color: #fff; position: relative;
+  background: var(--navy); border-radius: 12px; padding: 13px 16px; color: #fff; position: relative;
   overflow: hidden;
 }
 .sa-scorecard::after {
   content: ""; position: absolute; right: -20px; top: -20px; width: 90px; height: 90px; border-radius: 50%;
   background: rgba(255,176,32,0.08);
 }
-.sa-scorecard-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-.sa-scorecard-label { font-size: 11.5px; text-transform: uppercase; letter-spacing: 1.3px; color: #91A3BE; font-weight: 600; }
-.sa-scorecard-value { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 30px; line-height: 1; }
-.sa-scorecard-sub { margin-top: 8px; font-size: 12px; color: #8CA0BC; }
+.sa-scorecard-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.sa-scorecard-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1.3px; color: #91A3BE; font-weight: 600; }
+.sa-scorecard-value { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 24px; line-height: 1; }
+.sa-scorecard-sub { margin-top: 5px; font-size: 11.5px; color: #8CA0BC; }
 
 /* ---------- Cards / Grids ---------- */
 .sa-dash-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
@@ -3183,7 +3348,7 @@ const STYLES = `
 .sa-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
 .sa-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .sa-card-header h3 { font-family: 'Oswald', sans-serif; font-size: 15px; font-weight: 600; letter-spacing: 0.3px; }
-.sa-inline-select { border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; font-family: 'Inter'; background: var(--bg); }
+.sa-inline-select { border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px; font-size: 12px; font-family: 'Inter'; background: var(--bg); }
 
 .sa-week-strip { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; overflow-x: auto; padding-bottom: 4px; }
 .sa-week-col { background: var(--bg); border-radius: 8px; padding: 6px 4px; min-height: 120px; }
@@ -3226,13 +3391,13 @@ const STYLES = `
 .sa-icon-btn:hover { background: var(--bg); color: var(--ink); }
 .sa-icon-btn-placeholder { display: inline-block; width: 30px; height: 30px; flex-shrink: 0; }
 
-.sa-page-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.sa-search-row { display: flex; gap: 10px; align-items: center; }
+.sa-page-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.sa-search-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
 .sa-search-box {
-  display: flex; align-items: center; gap: 8px; background: var(--card); border: 1px solid var(--border);
-  border-radius: 8px; padding: 8px 12px; min-width: 260px; color: var(--muted);
+  display: flex; align-items: center; gap: 7px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; min-width: 220px; color: var(--muted);
 }
-.sa-search-box input { border: none; outline: none; font-family: 'Inter'; font-size: 13.5px; width: 100%; color: var(--ink); }
+.sa-search-box input { border: none; outline: none; font-family: 'Inter'; font-size: 13px; width: 100%; color: var(--ink); }
 
 /* ---------- Table ---------- */
 .sa-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
@@ -3248,7 +3413,7 @@ const STYLES = `
 .sa-td-actions { display: flex; gap: 2px; }
 .sa-row-clickable { cursor: pointer; }
 .sa-row-clickable:hover { background: var(--bg); }
-.sa-th-center { text-align: center; }
+th.sa-th-center, td.sa-th-center { text-align: center; }
 .sa-th-sub { text-align: center; font-size: 10px; }
 .sa-table-compact th, .sa-table-compact td { padding: 8px 10px; font-size: 12px; }
 .sa-row-paid { background: #F0FDF9; }
@@ -3287,7 +3452,22 @@ const STYLES = `
   border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; font-family: 'Inter'; font-size: 13.5px;
   font-weight: 400; color: var(--ink); outline: none;
 }
+.sa-field input[type="number"] { -moz-appearance: textfield; }
+.sa-field input[type="number"]::-webkit-outer-spin-button,
+.sa-field input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .sa-field input:focus, .sa-field select:focus { border-color: var(--amber); box-shadow: 0 0 0 3px rgba(255,176,32,0.15); }
+.sa-date-input { position: relative; cursor: pointer; }
+.sa-date-input input[type="date"] { width: 100%; cursor: pointer; color: transparent; }
+.sa-date-input input[type="date"]::-webkit-datetime-edit,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-fields-wrapper { color: transparent; }
+.sa-date-display {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  pointer-events: none; font-family: 'Inter'; font-size: 13.5px; font-weight: 400; color: var(--ink);
+  padding: 9px 11px;
+}
+.sa-inline-select.sa-date-input { display: inline-block; }
+.sa-inline-select.sa-date-input .sa-date-display { padding: 4px 7px; font-size: 12px; }
+.sa-inline-select.sa-att-date .sa-date-display { font-size: 13px; font-weight: 700; color: var(--navy); }
 .sa-form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
 .sa-checkbox-group { display: flex; flex-wrap: wrap; gap: 10px; }
 .sa-checkbox { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; color: var(--ink); background: var(--bg); padding: 7px 11px; border-radius: 7px; }
@@ -3353,7 +3533,18 @@ const STYLES = `
 .sa-att-btn { border: 1px solid var(--border); background: var(--card); padding: 6px 12px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; color: var(--muted); }
 .sa-att-btn-p { background: #CCFBF1; border-color: #14B8A6; color: #0F766E; }
 .sa-att-btn-a { background: #FEE2E2; border-color: #EF4444; color: #B91C1C; }
-.sa-att-btn-wide { padding: 7px 18px; min-width: 90px; }
+
+.sa-att-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.sa-att-toggle-btn {
+  border: none; background: var(--card); padding: 6px 14px; cursor: pointer; color: var(--muted);
+  display: flex; align-items: center; justify-content: center;
+}
+.sa-att-toggle-btn:first-child { border-right: 1px solid var(--border); }
+.sa-att-toggle-p.sa-att-toggle-active { background: #14B8A6; color: #ffffff; }
+.sa-att-toggle-a.sa-att-toggle-active { background: #EF4444; color: #ffffff; }
+
+.sa-attendance-scroll { max-height: 722px; overflow-y: auto; }
+.sa-attendance-scroll thead th { position: sticky; top: 0; z-index: 1; }
 
 /* ---------- Fee Update ---------- */
 .sa-search-results { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
@@ -3391,5 +3582,21 @@ const STYLES = `
   .sa-topbar { padding: 16px 18px; }
   .sa-content { padding: 18px; }
   .sa-scoreboard { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 640px) {
+  .sa-attendance-table { table-layout: fixed; width: 100%; }
+  .sa-attendance-table .sa-col-name { display: none; }
+  .sa-attendance-table th, .sa-attendance-table td {
+    padding: 6px 4px; font-size: 10.5px; white-space: normal; word-break: break-word; text-align: center;
+  }
+  .sa-attendance-table th:nth-child(2), .sa-attendance-table td:nth-child(2) { width: 22%; text-align: left; }
+  .sa-attendance-table th:nth-child(3), .sa-attendance-table td:nth-child(3) { width: 13%; }
+  .sa-attendance-table th:nth-child(4), .sa-attendance-table td:nth-child(4) { width: 18%; }
+  .sa-attendance-table th:nth-child(5), .sa-attendance-table td:nth-child(5) { width: 18%; }
+  .sa-attendance-table th:nth-child(6), .sa-attendance-table td:nth-child(6) { width: 29%; }
+  .sa-attendance-table .sa-att-toggle-btn { padding: 5px 8px; }
+  .sa-attendance-table .sa-pill { padding: 2px 5px; font-size: 9px; margin-left: 0; }
+  .sa-attendance-scroll { max-height: 639px; }
 }
 `;

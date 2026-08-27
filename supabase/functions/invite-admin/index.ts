@@ -43,7 +43,9 @@ Deno.serve(async (req) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
-  const { data: invited, error } = await adminClient.auth.admin.inviteUserByEmail(email);
+  const { data: invited, error } = await adminClient.auth.admin.inviteUserByEmail(email, {
+    redirectTo: "https://sportsplayuae.com",
+  });
   if (error) {
     return respond({ error: error.message }, 400);
   }
