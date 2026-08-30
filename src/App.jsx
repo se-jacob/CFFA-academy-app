@@ -3,7 +3,7 @@ import {
   LayoutDashboard, MapPin, Wallet, Layers, Users, Calendar as CalendarIcon,
   Receipt, FileBarChart, Plus, Pencil, Trash2, X, Search, ChevronLeft,
   ChevronRight, Download, Check, AlertCircle, Clock, TrendingUp,
-  UserRound, Phone, Mail, Menu, ClipboardList, MessageSquare, ShieldCheck, ShieldOff
+  UserRound, Phone, Mail, Menu, ClipboardList, MessageSquare, ShieldCheck, ShieldOff, UserX
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -241,7 +241,8 @@ async function loadAllData() {
     id: p.id, studentId: p.student_id, date: p.date, receiptNo: p.receipt_no,
     amount: p.amount, nextPaymentDate: p.next_payment_date || "", comment: p.comment || "",
     paymentType: p.payment_type || "Fee", startDate: p.start_date || "", endDate: p.end_date || "",
-    registrationFeeAmount: p.registration_fee_amount ?? "",
+    registrationFeeAmount: p.registration_fee_amount ?? "", paymentMode: p.payment_mode || "",
+    paymentMonth: p.payment_month || "",
   }));
 
   return { locations, paymentPlans, batches, coaches, students, sessions, attendance, payments };
@@ -306,28 +307,32 @@ function feePaidForStudentInMonth(data, studentId, mKey) {
     .filter((p) => p.studentId === studentId && monthKey(p.date) === mKey)
     .reduce((sum, p) => sum + Number(p.amount || 0), 0);
 }
+// Dashboard "Income" for a given month (mKey, "YYYY-MM"): sum of the Fee
+// amount plus the Registration fee amount for every payment whose
+// payment_month (which month the payment is FOR, stored "MM/YYYY") is the
+// given month — not the payment's actual date.
 function totalPaidInMonth(data, students, mKey) {
   const ids = new Set(students.map((s) => s.id));
+  const feeMonthKey = `${mKey.slice(5, 7)}/${mKey.slice(0, 4)}`; // "YYYY-MM" -> "MM/YYYY"
   return data.payments
-    .filter((p) => ids.has(p.studentId) && monthKey(p.date) === mKey)
-    .reduce((a, p) => a + Number(p.amount || 0) + Number(p.registrationFeeAmount || 0), 0);
+    .filter((p) => ids.has(p.studentId) && p.paymentMonth === feeMonthKey)
+    .reduce((sum, p) => sum + Number(p.amount || 0) + Number(p.registrationFeeAmount || 0), 0);
 }
-function computeOutstandingInMonth(data, students, mKey) {
-  return students.reduce((sum, s) => {
-    const expected = studentExpectedFee(data, s);
-    const paid = feePaidForStudentInMonth(data, s.id, mKey);
-    const due = expected - paid;
-    return sum + (due > 0 ? due : 0);
-  }, 0);
+// Matches the Reports > Pending Fees report exactly: same per-student
+// totalOverdueAmountFor sum, gated by the same isPendingForFees attendance rule that report's
+// row list uses, so a student with no attendance evidence contributes 0 here too.
+function computeOutstanding(data, students, asOf) {
+  return students.reduce((sum, s) => sum + (isPendingForFees(data, s, asOf) ? totalOverdueAmountFor(data, s, asOf) : 0), 0);
 }
 function sessionsTakenCount(data, sessions) {
   return sessions.filter((s) => s.date <= todayISO()).length;
 }
-function monthsElapsedInclusive(fromIso, toIso) {
-  const from = parseISO(startOfMonth(fromIso));
-  const to = parseISO(startOfMonth(toIso));
-  return (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth()) + 1;
-}
+// Walks billing cycles (of the plan's duration) from the student's last due date up to
+// asOf, and only bills a cycle if the student has at least one "Present" attendance
+// record within that cycle's date range. This avoids charging for months where the
+// student simply didn't attend (e.g. a long break) — see the AARAV KUMAR case: due
+// 7 Mar 2026, paid through 6 Mar 2026, then no attendance until August. Only August's
+// cycle should be billed, not all 6 elapsed months.
 function totalOverdueAmountFor(data, student, asOf) {
   const feePerCycle = studentExpectedFee(data, student);
   const last = latestPayment(data, student.id);
@@ -336,12 +341,23 @@ function totalOverdueAmountFor(data, student, asOf) {
   if (last.nextPaymentDate > today) return 0;
   const plan = studentPlan(data, student);
   const duration = plan?.duration || "Monthly";
-  const monthsOverdue = monthsElapsedInclusive(last.nextPaymentDate, today);
-  let cycles;
-  if (duration === "Monthly") cycles = monthsOverdue;
-  else if (duration === "Quarterly") cycles = Math.ceil(monthsOverdue / 3);
-  else if (duration === "4 Months") cycles = Math.ceil(monthsOverdue / 4);
-  else cycles = 1;
+  const cycleMonths = duration === "Monthly" ? 1 : duration === "Quarterly" ? 3 : duration === "4 Months" ? 4 : null;
+  if (cycleMonths == null) return feePerCycle;
+  let cycles = 0;
+  let cycleStart = startOfMonth(last.nextPaymentDate);
+  const horizon = startOfMonth(today);
+  let guard = 0;
+  while (cycleStart <= horizon && guard < 1200) {
+    const cycleEnd = shiftMonths(cycleStart, cycleMonths);
+    const attendedThisCycle = data.attendance.some((a) => {
+      if (a.studentId !== student.id || a.status !== "P") return false;
+      const session = data.sessions.find((se) => se.id === a.sessionId);
+      return session && session.date >= cycleStart && session.date < cycleEnd;
+    });
+    if (attendedThisCycle) cycles += 1;
+    cycleStart = cycleEnd;
+    guard += 1;
+  }
   return cycles * feePerCycle;
 }
 function sessionsOverdueCountFor(data, student) {
@@ -361,6 +377,45 @@ function hasAttendedSinceDue(data, student) {
     if (!cutoff) return true;
     const session = data.sessions.find((se) => se.id === a.sessionId);
     return session && session.date >= cutoff;
+  });
+}
+// Whether the student has a "Present" attendance record for any session on or after cutoffIso,
+// regardless of how that date relates to the student's next payment date.
+function hasAttendedOnOrAfter(data, studentId, cutoffIso) {
+  return data.attendance.some((a) => {
+    if (a.studentId !== studentId || a.status !== "P") return false;
+    const session = data.sessions.find((se) => se.id === a.sessionId);
+    return session && session.date >= cutoffIso;
+  });
+}
+// Single source of truth for "does this student belong on a pending/overdue fee list" — has the
+// student attended at least one session within the last 2 months (from asOf)? Used by the Pending
+// Fees report and the dashboard's outstanding-amount figure, so they stay in sync.
+//
+// Deliberately recency-only, with no "attended at some point after their due date" branch: that
+// check has no upper bound, so a student whose only qualifying attendance is months old (even if it
+// was technically after their due date) would stay on the pending list forever off one stale record.
+// A student needs to have shown up recently to still be considered pending.
+function isPendingForFees(data, student, asOf) {
+  const twoMonthsPriorStart = shiftMonths(asOf || todayISO(), -2);
+  return hasAttendedOnOrAfter(data, student.id, twoMonthsPriorStart);
+}
+// Latest session date the student has a "Present" attendance record for, or null if never.
+function lastAttendedDate(data, studentId) {
+  let latest = null;
+  for (const a of data.attendance) {
+    if (a.studentId !== studentId || a.status !== "P") continue;
+    const session = data.sessions.find((se) => se.id === a.sessionId);
+    if (session && (!latest || session.date > latest)) latest = session.date;
+  }
+  return latest;
+}
+// True if the student has at least one "Present" record on a session dated after cutoffDate.
+function hasAttendedAfter(data, studentId, cutoffDate) {
+  return data.attendance.some((a) => {
+    if (a.studentId !== studentId || a.status !== "P") return false;
+    const session = data.sessions.find((se) => se.id === a.sessionId);
+    return session && session.date > cutoffDate;
   });
 }
 function studentsAttendedThisMonthByLocation(data) {
@@ -436,10 +491,10 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
   );
 }
 
-function Field({ label, children }) {
+function Field({ label, children, required }) {
   return (
     <label className="sa-field">
-      <span>{label}</span>
+      <span>{label}{required && <span className="sa-field-required"> *</span>}</span>
       {children}
     </label>
   );
@@ -569,7 +624,7 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
   );
   const currentMonthKey = monthKey(todayISO());
   const paid = totalPaidInMonth(data, scopedStudents, currentMonthKey);
-  const outstanding = computeOutstandingInMonth(data, scopedStudents, currentMonthKey);
+  const outstanding = computeOutstanding(data, scopedStudents, todayISO());
   const revenue = paid + outstanding;
 
   const attendedByLocationRaw = studentsAttendedThisMonthByLocation(data);
@@ -1139,20 +1194,125 @@ function StudentDetail({ data, student, onClose }) {
         ) : (
           <div className="sa-table-wrap">
             <table className="sa-table sa-table-compact">
-              <thead><tr><th>Date</th><th>Receipt No.</th><th>Amount</th><th>Next Due</th></tr></thead>
+              <thead><tr><th>Date</th><th>Receipt No.</th><th>Mode</th><th>Amount</th><th>Next Due</th><th>Start Date</th><th>End Date</th></tr></thead>
               <tbody>
                 {payments.map((p) => (
                   <tr key={p.id}>
                     <td>{fmtDate(p.date)}</td>
                     <td className="sa-mono">{p.receiptNo}</td>
+                    <td>{p.paymentMode || "—"}</td>
                     <td className="sa-mono">{money(p.amount)}</td>
                     <td>{fmtDate(p.nextPaymentDate)}</td>
+                    <td>{p.startDate ? fmtDate(p.startDate) : "—"}</td>
+                    <td>{p.endDate ? fmtDate(p.endDate) : "—"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+// Lets an admin pick a cutoff date, review every currently-Active player with no
+// "Present" attendance after that date, deselect any they want to keep, then
+// bulk-apply status = "Inactive" to the rest. Nothing is written until confirmed.
+function InactivityReviewModal({ data, locationId, onClose, refetchData }) {
+  const defaultCutoff = dateISO(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
+  const [cutoff, setCutoff] = useState(defaultCutoff);
+  const [skipRecentJoiners, setSkipRecentJoiners] = useState(true);
+  const [selected, setSelected] = useState(() => new Set());
+  const [applying, setApplying] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+
+  const candidates = useMemo(() => {
+    return data.students
+      .filter((s) => s.status === "Active")
+      .filter((s) => locationId === "ALL" || s.locationId === locationId)
+      .filter((s) => !skipRecentJoiners || !s.dateOfJoining || s.dateOfJoining <= cutoff)
+      .filter((s) => !hasAttendedAfter(data, s.id, cutoff))
+      .map((s) => ({ student: s, last: lastAttendedDate(data, s.id) }));
+  }, [data, locationId, cutoff, skipRecentJoiners]);
+
+  // Default every new candidate list to "all selected" until the admin manually
+  // unchecks something; re-selecting all resets after the filters change.
+  useEffect(() => {
+    setSelected(new Set(candidates.map((c) => c.student.id)));
+  }, [candidates]);
+
+  const toggle = (id) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSelected(next);
+  };
+  const toggleAll = () => {
+    if (selected.size === candidates.length) setSelected(new Set());
+    else setSelected(new Set(candidates.map((c) => c.student.id)));
+  };
+
+  const apply = async () => {
+    if (selected.size === 0) return;
+    setApplying(true);
+    const { error } = await supabase.from("students").update({ status: "Inactive" }).in("id", [...selected]);
+    setApplying(false);
+    if (error) { setSaveError(error.message); return; }
+    setSaveError(null);
+    await refetchData();
+    onClose();
+  };
+
+  return (
+    <Modal title="Review & Mark Inactive" onClose={onClose} wide>
+      {saveError && <div className="sa-login-error"><AlertCircle size={14} /> {saveError}</div>}
+      <p className="sa-muted-text">
+        Shows currently Active players with no attendance marked "Present" after the date below. Nothing changes until you click Apply.
+      </p>
+      <div className="sa-form-row">
+        <Field label="No Present attendance after">
+          <DateInput value={cutoff} onChange={(e) => setCutoff(e.target.value)} max={todayISO()} />
+        </Field>
+        <Field label="Recent joiners">
+          <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+            <input type="checkbox" checked={skipRecentJoiners} onChange={(e) => setSkipRecentJoiners(e.target.checked)} />
+            Skip players who joined after the cutoff
+          </label>
+        </Field>
+      </div>
+
+      {candidates.length === 0 ? (
+        <EmptyState icon={UserX} title="No candidates" message="No Active player matches this cutoff." />
+      ) : (
+        <div className="sa-table-wrap">
+          <table className="sa-table sa-table-compact">
+            <thead>
+              <tr>
+                <th><input type="checkbox" checked={selected.size === candidates.length} onChange={toggleAll} /></th>
+                <th>Name</th><th>Batch</th><th>Location</th><th>Joined</th><th>Last Attended</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.map(({ student: s, last }) => (
+                <tr key={s.id}>
+                  <td><input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} /></td>
+                  <td className="sa-td-strong">{s.name}</td>
+                  <td>{batchName(data, s.batchId)}</td>
+                  <td>{locationName(data, s.locationId)}</td>
+                  <td>{fmtDate(s.dateOfJoining)}</td>
+                  <td>{last ? fmtDate(last) : "Never"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="sa-form-actions">
+        <button className="sa-btn sa-btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="sa-btn sa-btn-primary" disabled={selected.size === 0 || applying} onClick={apply}>
+          {applying ? "Applying…" : `Mark ${selected.size} Inactive`}
+        </button>
       </div>
     </Modal>
   );
@@ -1166,6 +1326,7 @@ function StudentsPage({ data, refetchData, locationId }) {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [remarkStudentId, setRemarkStudentId] = useState(null);
   const [saveError, setSaveError] = useState(null);
+  const [inactivityReviewOpen, setInactivityReviewOpen] = useState(false);
 
   const blank = {
     name: "", phone: "", email: "", dob: "", dateOfJoining: "", batchId: "",
@@ -1237,6 +1398,7 @@ function StudentsPage({ data, refetchData, locationId }) {
             <option>All</option><option>Active</option><option>Inactive</option>
           </select>
         </div>
+        <button className="sa-btn sa-btn-ghost" onClick={() => setInactivityReviewOpen(true)}><UserX size={16} /> Review Inactivity</button>
         <button className="sa-btn sa-btn-primary" onClick={openAdd}><Plus size={16} /> Add Player</button>
       </div>
 
@@ -1302,6 +1464,15 @@ function StudentsPage({ data, refetchData, locationId }) {
 
       {confirmDelete && (
         <ConfirmDialog message="Delete this player and their records?" onCancel={() => setConfirmDelete(null)} onConfirm={() => remove(confirmDelete)} />
+      )}
+
+      {inactivityReviewOpen && (
+        <InactivityReviewModal
+          data={data}
+          locationId={locationId}
+          onClose={() => setInactivityReviewOpen(false)}
+          refetchData={refetchData}
+        />
       )}
     </div>
   );
@@ -2020,41 +2191,107 @@ function SchedulesPage({ data, refetchData, locationId }) {
 /* ============================== FEE UPDATE ============================== */
 
 const PAYMENT_TYPES = ["Fee", "Extra Jersey", "Full Kit"];
+const PAYMENT_MODES = ["Cash", "Card", "Bank Transfer", "Payment Link"];
+const PAYMENT_MONTHS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
 
 function RecordPaymentForm({ initial, onCancel, onSave }) {
   const [form, setForm] = useState(initial || {
-    paymentType: "Fee", date: todayISO(), receiptNo: "", amount: "", nextPaymentDate: addDays(todayISO(), 30),
+    paymentType: "Fee", paymentMode: "", paymentMonth: "", date: todayISO(), receiptNo: "", amount: "", nextPaymentDate: "",
     startDate: "", endDate: "", registrationFeeAmount: "", comment: "",
   });
+  const [submitting, setSubmitting] = useState(false);
   const isFee = form.paymentType === "Fee";
-  const canSave = form.paymentType && form.amount !== "" && form.receiptNo.trim();
+
+  // Payment Month is stored as "MM/YYYY" so it's unambiguous across years; the
+  // UI still shows it as a month-name dropdown (unchanged) plus a year dropdown.
+  const currentYear = new Date().getFullYear();
+  const [pmMonthNum, pmYearStr] = (form.paymentMonth || "").split("/");
+  const pmMonthName = pmMonthNum ? (PAYMENT_MONTHS[Number(pmMonthNum) - 1] || "") : "";
+  const pmYear = pmYearStr || String(currentYear);
+  const PAYMENT_YEARS = Array.from({ length: 7 }, (_, i) => String(currentYear - 5 + i));
+  const setPmMonthName = (name) => {
+    const mm = String(PAYMENT_MONTHS.indexOf(name) + 1).padStart(2, "0");
+    setForm({ ...form, paymentMonth: `${mm}/${pmYear}` });
+  };
+  const setPmYear = (year) => {
+    setForm({ ...form, paymentMonth: `${pmMonthNum || ""}/${year}` });
+  };
+  const paymentMonthValid = /^(0[1-9]|1[0-2])\/\d{4}$/.test(form.paymentMonth || "");
+
+  const canSave = form.paymentType && form.paymentMode && paymentMonthValid && form.date && form.receiptNo.trim() && form.amount !== ""
+    && (!isFee || (form.startDate && form.endDate && form.nextPaymentDate));
+
+  // End Date is derived from Next Payment Date and isn't directly editable.
+  useEffect(() => {
+    setForm((f) => ({ ...f, endDate: f.nextPaymentDate ? addDays(f.nextPaymentDate, -1) : "" }));
+  }, [form.nextPaymentDate]);
+
+  const handleSave = async () => {
+    if (!canSave || submitting) return;
+    setSubmitting(true);
+    try {
+      await onSave(form);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <div className="sa-form">
-      <Field label="Payment Type">
-        <select value={form.paymentType} onChange={(e) => setForm({ ...form, paymentType: e.target.value })}>
-          {PAYMENT_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-        </select>
-      </Field>
+      <div className="sa-form-row">
+        <Field label="Payment Type" required>
+          <select value={form.paymentType} onChange={(e) => setForm({ ...form, paymentType: e.target.value })}>
+            {PAYMENT_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </Field>
+        <Field label="Payment Mode" required>
+          <select value={form.paymentMode} onChange={(e) => setForm({ ...form, paymentMode: e.target.value })}>
+            <option value="" disabled>Select mode…</option>
+            {PAYMENT_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </Field>
+      </div>
 
       <div className="sa-form-row">
-        <Field label="Payment Date"><DateInput value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
-        <Field label="Receipt No."><input value={form.receiptNo} onChange={(e) => setForm({ ...form, receiptNo: e.target.value })} placeholder="RC-1000" /></Field>
+        <Field label="Payment Date" required><DateInput value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
+        <Field label="Payment Month" required>
+          <div className="sa-form-row" style={{ gap: 8 }}>
+            <select value={pmMonthName} onChange={(e) => setPmMonthName(e.target.value)}>
+              <option value="" disabled>Select month…</option>
+              {PAYMENT_MONTHS.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+            <select value={pmYear} onChange={(e) => setPmYear(e.target.value)}>
+              {PAYMENT_YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
+            </select>
+          </div>
+        </Field>
       </div>
 
       {isFee ? (
         <>
           <div className="sa-form-row">
-            <Field label="Start Date"><DateInput value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} /></Field>
-            <Field label="End Date"><DateInput value={form.endDate} onChange={(e) => setForm({ ...form, endDate: e.target.value })} /></Field>
+            <Field label={`Registration Fee Amount (${CURRENCY})`}><input type="number" min="0" value={form.registrationFeeAmount} onChange={(e) => setForm({ ...form, registrationFeeAmount: e.target.value })} /></Field>
+            <Field label={`Session Fee Amount (${CURRENCY})`} required><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
           </div>
           <div className="sa-form-row">
-            <Field label="Next Payment Date"><DateInput value={form.nextPaymentDate} onChange={(e) => setForm({ ...form, nextPaymentDate: e.target.value })} /></Field>
-            <Field label={`Registration Fee Amount (${CURRENCY})`}><input type="number" min="0" value={form.registrationFeeAmount} onChange={(e) => setForm({ ...form, registrationFeeAmount: e.target.value })} /></Field>
+            <Field label="Start Date" required><DateInput value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} /></Field>
+            <Field label="End Date" required>
+              <input value={form.endDate ? fmtDate(form.endDate) : ""} readOnly />
+            </Field>
           </div>
-          <Field label={`Session Fee Amount (${CURRENCY})`}><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
+          <div className="sa-form-row">
+            <Field label="Receipt No." required><input value={form.receiptNo} onChange={(e) => setForm({ ...form, receiptNo: e.target.value })} placeholder="RC-1000" /></Field>
+            <Field label="Next Payment Date" required><DateInput value={form.nextPaymentDate} onChange={(e) => setForm({ ...form, nextPaymentDate: e.target.value })} /></Field>
+          </div>
         </>
       ) : (
-        <Field label={`Payment Amount (${CURRENCY})`}><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
+        <div className="sa-form-row">
+          <Field label="Receipt No." required><input value={form.receiptNo} onChange={(e) => setForm({ ...form, receiptNo: e.target.value })} placeholder="RC-1000" /></Field>
+          <Field label={`Payment Amount (${CURRENCY})`} required><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
+        </div>
       )}
 
       <Field label="Comments (optional)">
@@ -2062,8 +2299,10 @@ function RecordPaymentForm({ initial, onCancel, onSave }) {
       </Field>
 
       <div className="sa-form-actions">
-        <button className="sa-btn sa-btn-ghost" onClick={onCancel}>Cancel</button>
-        <button className="sa-btn sa-btn-primary" disabled={!canSave} onClick={() => { if (canSave) onSave(form); }}>{initial ? "Save Changes" : "Record Payment"}</button>
+        <button className="sa-btn sa-btn-ghost" onClick={onCancel} disabled={submitting}>Cancel</button>
+        <button className="sa-btn sa-btn-primary" disabled={!canSave || submitting} onClick={handleSave}>
+          {submitting ? "Saving…" : (initial ? "Save Changes" : "Record Payment")}
+        </button>
       </div>
     </div>
   );
@@ -2078,6 +2317,13 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
   const [editingPayment, setEditingPayment] = useState(null);
   const [viewCommentPayment, setViewCommentPayment] = useState(null);
   const [saveError, setSaveError] = useState(null);
+  const [successMessage, setSuccessMessage] = useState(null);
+
+  useEffect(() => {
+    if (!successMessage) return;
+    const t = setTimeout(() => setSuccessMessage(null), 4000);
+    return () => clearTimeout(t);
+  }, [successMessage]);
 
   if (!locationId) return <EmptyState icon={Receipt} title="No location selected" message="Add a location first." />;
 
@@ -2093,7 +2339,8 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
     const { error } = await supabase.from("payments").insert({
       student_id: selected.id, date: form.date, receipt_no: form.receiptNo,
       amount: Number(form.amount), next_payment_date: isFee ? (form.nextPaymentDate || null) : null,
-      comment: form.comment || null, payment_type: form.paymentType,
+      comment: form.comment || null, payment_type: form.paymentType, payment_mode: form.paymentMode,
+      payment_month: form.paymentMonth,
       start_date: isFee ? (form.startDate || null) : null, end_date: isFee ? (form.endDate || null) : null,
       registration_fee_amount: isFee && form.registrationFeeAmount !== "" ? Number(form.registrationFeeAmount) : null,
     });
@@ -2101,6 +2348,7 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
     setSaveError(null);
     await refetchData();
     setPayModal(false);
+    setSuccessMessage("Payment recorded successfully.");
   };
 
   const updateLastPayment = async (form) => {
@@ -2110,7 +2358,8 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
       .update({
         date: form.date, receipt_no: form.receiptNo, amount: Number(form.amount),
         next_payment_date: isFee ? (form.nextPaymentDate || null) : null,
-        comment: form.comment || null, payment_type: form.paymentType,
+        comment: form.comment || null, payment_type: form.paymentType, payment_mode: form.paymentMode,
+        payment_month: form.paymentMonth,
         start_date: isFee ? (form.startDate || null) : null, end_date: isFee ? (form.endDate || null) : null,
         registration_fee_amount: isFee && form.registrationFeeAmount !== "" ? Number(form.registrationFeeAmount) : null,
       })
@@ -2119,12 +2368,16 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
     setSaveError(null);
     await refetchData();
     setEditingPayment(null);
+    setSuccessMessage("Payment updated successfully.");
   };
 
   const pendingStudents = students
     .filter((s) => studentFeeStatus(data, s) !== "Paid")
     .map((s) => ({ s, status: studentFeeStatus(data, s), last: latestPayment(data, s.id), sessionsOverdue: sessionsOverdueCountFor(data, s) }))
-    .filter(({ s }) => s.status === "Active" || hasAttendedSinceDue(data, s));
+    // Same isPendingForFees rule as the Reports > Pending Fees report and the dashboard's
+    // outstanding figure, so all three stay in sync: a student whose next payment date is
+    // more than 2 months back and who hasn't attended any session since is excluded here too.
+    .filter(({ s }) => isPendingForFees(data, s));
 
   const paidStudents = students
     .filter((s) => studentFeeStatus(data, s) === "Paid")
@@ -2133,6 +2386,11 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
   return (
     <div className="sa-page">
       {saveError && <div className="sa-storage-warning"><AlertCircle size={14} /> {saveError}</div>}
+      {successMessage && (
+        <div className="sa-storage-warning" style={{ background: "#ECFDF5", color: "#047857", borderColor: "#A7F3D0" }}>
+          <Check size={14} /> {successMessage}
+        </div>
+      )}
       <div className="sa-card">
         <div className="sa-card-header"><h3>Find a Player</h3></div>
         <div className="sa-search-box" style={{ maxWidth: 420 }}>
@@ -2175,11 +2433,11 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
           ) : (
             <div className="sa-table-wrap">
               <table className="sa-table sa-table-compact">
-                <thead><tr><th>Date</th><th>Receipt No.</th><th>Amount</th><th>Next Due</th><th></th><th></th></tr></thead>
+                <thead><tr><th>Date</th><th>Receipt No.</th><th>Mode</th><th>Amount</th><th>Next Due</th><th>Start Date</th><th>End Date</th><th></th><th></th></tr></thead>
                 <tbody>
                   {studentPayments(data, selected.id).map((p, i) => (
                     <tr key={p.id}>
-                      <td>{fmtDate(p.date)}</td><td className="sa-mono">{p.receiptNo}</td><td className="sa-mono">{money(p.amount)}</td><td>{fmtDate(p.nextPaymentDate)}</td>
+                      <td>{fmtDate(p.date)}</td><td className="sa-mono">{p.receiptNo}</td><td>{p.paymentMode || "—"}</td><td className="sa-mono">{money(p.amount)}</td><td>{fmtDate(p.nextPaymentDate)}</td><td>{p.startDate ? fmtDate(p.startDate) : "—"}</td><td>{p.endDate ? fmtDate(p.endDate) : "—"}</td>
                       <td>
                         {p.comment && p.comment.trim() ? (
                           <button className="sa-icon-btn" title="View comment" onClick={() => setViewCommentPayment(p)}><MessageSquare size={14} /></button>
@@ -2280,6 +2538,8 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
           <RecordPaymentForm
             initial={{
               paymentType: editingPayment.payment.paymentType || "Fee",
+              paymentMode: editingPayment.payment.paymentMode || "",
+              paymentMonth: editingPayment.payment.paymentMonth || "",
               date: editingPayment.payment.date,
               receiptNo: editingPayment.payment.receiptNo,
               amount: editingPayment.payment.amount,
@@ -2600,7 +2860,7 @@ function ReportPendingFee({ data }) {
         : 0;
       return { s, overdue, last, dueAmount, sessionsAfterDue };
     })
-    .filter((r) => r.overdue);
+    .filter((r) => r.overdue && isPendingForFees(data, r.s, asOf));
 
   const exportExcel = () => {
     const headers = ["Player Name", "Jersey Name", "Jersey No.", "Contact", "Player Status", "Status", "Amount Paid", "Receipt No.", "Next Payment Date", "Due Amount", "No. of sessions(pending payment)"];
@@ -3448,6 +3708,7 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
 .sa-form { display: flex; flex-direction: column; gap: 14px; }
 .sa-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .sa-field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--navy); }
+.sa-field-required { color: #DC2626; }
 .sa-field input, .sa-field select, .sa-field textarea {
   border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; font-family: 'Inter'; font-size: 13.5px;
   font-weight: 400; color: var(--ink); outline: none;
@@ -3456,10 +3717,25 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
 .sa-field input[type="number"]::-webkit-outer-spin-button,
 .sa-field input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .sa-field input:focus, .sa-field select:focus { border-color: var(--amber); box-shadow: 0 0 0 3px rgba(255,176,32,0.15); }
+.sa-field input[readonly] { background: var(--bg); color: var(--muted); cursor: not-allowed; }
+.sa-field input[readonly]:focus { border-color: var(--border); box-shadow: none; }
 .sa-date-input { position: relative; cursor: pointer; }
 .sa-date-input input[type="date"] { width: 100%; cursor: pointer; color: transparent; }
 .sa-date-input input[type="date"]::-webkit-datetime-edit,
-.sa-date-input input[type="date"]::-webkit-datetime-edit-fields-wrapper { color: transparent; }
+.sa-date-input input[type="date"]::-webkit-datetime-edit-fields-wrapper,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-text,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-month-field,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-day-field,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-year-field {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background: transparent;
+}
+.sa-date-input input[type="date"]::-webkit-datetime-edit-month-field:focus,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-day-field:focus,
+.sa-date-input input[type="date"]::-webkit-datetime-edit-year-field:focus {
+  background-color: transparent;
+}
 .sa-date-display {
   position: absolute; inset: 0; display: flex; align-items: center;
   pointer-events: none; font-family: 'Inter'; font-size: 13.5px; font-weight: 400; color: var(--ink);
