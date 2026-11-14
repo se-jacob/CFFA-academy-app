@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef } from "react";
 import {
   LayoutDashboard, MapPin, Wallet, Layers, Users, Calendar as CalendarIcon,
   Receipt, FileBarChart, Plus, Pencil, Trash2, X, Search, ChevronLeft,
@@ -37,6 +37,14 @@ const NAV_ITEMS = [
   { id: "manageAdmins", label: "Manage Admins", icon: ShieldCheck, superAdminOnly: true },
 ];
 const LOCATION_SCOPED = new Set(["paymentPlans", "batches", "students", "attendance", "coaches", "schedules", "feeUpdate"]);
+// Pages a location_admin may open. super_admin can open everything.
+const LOCATION_ADMIN_VIEWS = new Set(["students", "attendance", "feeUpdate"]);
+function canAccessView(role, viewId) {
+  return role === "super_admin" || LOCATION_ADMIN_VIEWS.has(viewId);
+}
+function defaultViewFor(role) {
+  return role === "super_admin" ? "dashboard" : "students";
+}
 
 /* ============================== UTILITIES ============================== */
 
@@ -174,21 +182,48 @@ function downloadXLSX(filename, headers, rows) {
 // same camelCase shape the UI already expects. Location-scoping needs no client-side
 // filtering here — RLS already returns only the rows the logged-in admin can see.
 
+// Supabase/PostgREST caps any single select() response at 1000 rows by default.
+// Tables like attendance and sessions grow past that over time, so a plain
+// `.select("*")` silently returns only an arbitrary 1000-row slice — the rest
+// (which can include a just-written row) never reaches the client, even
+// though it's really in the database. fetchAllRows() pages past that cap with
+// `.range()`, ordering by column(s) that are unique per row (a surrogate "id"
+// on most tables; the two FK columns themselves on the plain join tables that
+// have no "id") so repeated pages see a consistent row order and nothing is
+// skipped or duplicated.
+const SUPABASE_PAGE_SIZE = 1000;
+async function fetchAllRows(table, { orderBy = ["id"] } = {}) {
+  const orderCols = Array.isArray(orderBy) ? orderBy : [orderBy];
+  let rows = [];
+  let from = 0;
+  for (;;) {
+    let q = supabase.from(table).select("*");
+    orderCols.forEach((col) => { q = q.order(col, { ascending: true }); });
+    q = q.range(from, from + SUPABASE_PAGE_SIZE - 1);
+    const { data, error } = await q;
+    if (error) return { data: null, error };
+    rows = rows.concat(data || []);
+    if (!data || data.length < SUPABASE_PAGE_SIZE) break;
+    from += SUPABASE_PAGE_SIZE;
+  }
+  return { data: rows, error: null };
+}
+
 async function loadAllData() {
   const [
     locationsRes, paymentPlansRes, batchesRes, coachesRes, coachLocationsRes,
     studentsRes, sessionsRes, sessionCoachesRes, attendanceRes, paymentsRes,
   ] = await Promise.all([
-    supabase.from("locations").select("*").order("name"),
-    supabase.from("payment_plans").select("*"),
-    supabase.from("batches").select("*"),
-    supabase.from("coaches").select("*"),
-    supabase.from("coach_locations").select("*"),
-    supabase.from("students").select("*").order("name"),
-    supabase.from("sessions").select("*"),
-    supabase.from("session_coaches").select("*"),
-    supabase.from("attendance").select("*"),
-    supabase.from("payments").select("*"),
+    fetchAllRows("locations", { orderBy: ["name", "id"] }),
+    fetchAllRows("payment_plans"),
+    fetchAllRows("batches"),
+    fetchAllRows("coaches"),
+    fetchAllRows("coach_locations", { orderBy: ["coach_id", "location_id"] }),
+    fetchAllRows("students", { orderBy: ["name", "id"] }),
+    fetchAllRows("sessions"),
+    fetchAllRows("session_coaches", { orderBy: ["session_id", "coach_id"] }),
+    fetchAllRows("attendance"),
+    fetchAllRows("payments"),
   ]);
 
   const firstError = [
@@ -241,21 +276,80 @@ async function loadAllData() {
   const attendance = (attendanceRes.data || []).map((a) => ({
     id: a.id, sessionId: a.session_id, studentId: a.student_id, status: a.status,
   }));
-  const payments = (paymentsRes.data || []).map((p) => ({
+  const payments = (paymentsRes.data || []).map(mapPaymentRow);
+
+  return { locations, paymentPlans, batches, coaches, students, sessions, attendance, payments };
+}
+
+function mapPaymentRow(p) {
+  return {
     id: p.id, studentId: p.student_id, date: p.date, receiptNo: p.receipt_no,
     amount: p.amount, nextPaymentDate: p.next_payment_date || "", comment: p.comment || "",
     paymentType: p.payment_type || "Fee", startDate: p.start_date || "", endDate: p.end_date || "",
     registrationFeeAmount: p.registration_fee_amount ?? "", paymentMode: p.payment_mode || "",
     paymentMonth: p.payment_month || "",
-  }));
+  };
+}
 
-  return { locations, paymentPlans, batches, coaches, students, sessions, attendance, payments };
+// Reloads only the payments table — used after recording/updating a payment, where
+// nothing else has changed, so there's no need to re-page attendance, sessions, etc.
+async function loadPayments() {
+  const res = await fetchAllRows("payments");
+  if (res.error) throw res.error;
+  return (res.data || []).map(mapPaymentRow);
 }
 
 /* ============================== DOMAIN HELPERS ============================== */
 
+// Lookup indexes built once per loaded array and cached by array identity (WeakMap),
+// so helpers that used to scan every attendance row — and do a sessions.find() for
+// each one — per student now do a direct lookup. Arrays are replaced (never mutated)
+// on every refetch, so a fresh load automatically gets fresh indexes. Results are
+// identical to the old full scans; only the lookup cost changes.
+const _paymentsIdx = new WeakMap();
+function paymentsByStudent(data) {
+  let m = _paymentsIdx.get(data.payments);
+  if (!m) {
+    m = new Map();
+    for (const p of data.payments) {
+      let list = m.get(p.studentId);
+      if (!list) { list = []; m.set(p.studentId, list); }
+      list.push(p);
+    }
+    _paymentsIdx.set(data.payments, m);
+  }
+  return m;
+}
+const _attendanceIdx = new WeakMap();
+// For each student: the sessions they were marked "Present" for (unique, only sessions
+// that exist), and whether they have any "Present" row at all (even for a missing session).
+function presentIndex(data) {
+  let entry = _attendanceIdx.get(data.attendance);
+  if (entry && entry.sessions === data.sessions) return entry.idx;
+  const sessionById = new Map();
+  for (const se of data.sessions) if (!sessionById.has(se.id)) sessionById.set(se.id, se);
+  const sessionsByStudent = new Map();
+  const anyPresent = new Set();
+  for (const a of data.attendance) {
+    if (a.status !== "P") continue;
+    anyPresent.add(a.studentId);
+    const se = sessionById.get(a.sessionId);
+    if (!se) continue;
+    let byId = sessionsByStudent.get(a.studentId);
+    if (!byId) { byId = new Map(); sessionsByStudent.set(a.studentId, byId); }
+    byId.set(se.id, se);
+  }
+  const idx = { sessionsByStudent, anyPresent };
+  _attendanceIdx.set(data.attendance, { sessions: data.sessions, idx });
+  return idx;
+}
+const _NO_SESSIONS = new Map();
+function presentSessionsFor(data, studentId) {
+  return presentIndex(data).sessionsByStudent.get(studentId) || _NO_SESSIONS;
+}
+
 function studentPayments(data, studentId) {
-  return data.payments.filter((p) => p.studentId === studentId).sort((a, b) => (a.date < b.date ? 1 : -1));
+  return (paymentsByStudent(data).get(studentId) || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 // The payment that determines a student's CURRENT fee due status. Only "Fee" type
 // payments count — Extra Jersey / Full Kit payments never carry a next_payment_date and
@@ -265,8 +359,8 @@ function studentPayments(data, studentId) {
 // catch-up payment and the current month's payment both entered today) are resolved by
 // which one actually extends the student furthest, not by arbitrary row order.
 function latestPayment(data, studentId) {
-  const feePayments = data.payments.filter(
-    (p) => p.studentId === studentId && p.paymentType === "Fee" && p.nextPaymentDate
+  const feePayments = (paymentsByStudent(data).get(studentId) || []).filter(
+    (p) => p.paymentType === "Fee" && p.nextPaymentDate
   );
   if (feePayments.length === 0) return null;
   return feePayments.reduce((best, p) => (p.nextPaymentDate > best.nextPaymentDate ? p : best));
@@ -357,9 +451,10 @@ function computeOutstanding(data, students, asOf) {
     }
     const overdue = last.nextPaymentDate <= asOf;
     if (!overdue || !isPendingForFees(data, s, asOf)) return sum;
-    const sessionsAfterDue = data.sessions
-      .filter((se) => se.locationId === s.locationId && se.date >= last.nextPaymentDate && se.date <= asOf)
-      .filter((se) => data.attendance.some((a) => a.sessionId === se.id && a.studentId === s.id && a.status === "P")).length;
+    let sessionsAfterDue = 0;
+    for (const se of presentSessionsFor(data, s.id).values()) {
+      if (se.locationId === s.locationId && se.date >= last.nextPaymentDate && se.date <= asOf) sessionsAfterDue += 1;
+    }
     if (sessionsAfterDue < 1) return sum;
     return sum + totalOverdueAmountFor(data, s, asOf);
   }, 0);
@@ -387,13 +482,10 @@ function totalOverdueAmountFor(data, student, asOf) {
   let cycleStart = startOfMonth(last.nextPaymentDate);
   const horizon = startOfMonth(today);
   let guard = 0;
+  const presentDates = [...presentSessionsFor(data, student.id).values()].map((se) => se.date);
   while (cycleStart <= horizon && guard < 1200) {
     const cycleEnd = shiftMonths(cycleStart, cycleMonths);
-    const attendedThisCycle = data.attendance.some((a) => {
-      if (a.studentId !== student.id || a.status !== "P") return false;
-      const session = data.sessions.find((se) => se.id === a.sessionId);
-      return session && session.date >= cycleStart && session.date < cycleEnd;
-    });
+    const attendedThisCycle = presentDates.some((d) => d >= cycleStart && d < cycleEnd);
     if (attendedThisCycle) cycles += 1;
     cycleStart = cycleEnd;
     guard += 1;
@@ -403,30 +495,25 @@ function totalOverdueAmountFor(data, student, asOf) {
 function sessionsOverdueCountFor(data, student) {
   const last = latestPayment(data, student.id);
   if (!last || !last.nextPaymentDate) return 0;
-  return data.sessions
-    .filter((se) => se.locationId === student.locationId && se.date > last.nextPaymentDate && se.date <= todayISO())
-    .filter((se) => data.attendance.some((a) => a.sessionId === se.id && a.studentId === student.id && a.status === "P"))
-    .length;
+  const today = todayISO();
+  let count = 0;
+  for (const se of presentSessionsFor(data, student.id).values()) {
+    if (se.locationId === student.locationId && se.date > last.nextPaymentDate && se.date <= today) count += 1;
+  }
+  return count;
 }
 // Until a student has a payment record with a due date, any attended session counts.
 // Once a due date exists, only sessions on or after that date count.
 function hasAttendedSinceDue(data, student) {
   const cutoff = latestPayment(data, student.id)?.nextPaymentDate;
-  return data.attendance.some((a) => {
-    if (a.studentId !== student.id || a.status !== "P") return false;
-    if (!cutoff) return true;
-    const session = data.sessions.find((se) => se.id === a.sessionId);
-    return session && session.date >= cutoff;
-  });
+  if (!cutoff) return presentIndex(data).anyPresent.has(student.id);
+  return hasAttendedOnOrAfter(data, student.id, cutoff);
 }
 // Whether the student has a "Present" attendance record for any session on or after cutoffIso,
 // regardless of how that date relates to the student's next payment date.
 function hasAttendedOnOrAfter(data, studentId, cutoffIso) {
-  return data.attendance.some((a) => {
-    if (a.studentId !== studentId || a.status !== "P") return false;
-    const session = data.sessions.find((se) => se.id === a.sessionId);
-    return session && session.date >= cutoffIso;
-  });
+  for (const se of presentSessionsFor(data, studentId).values()) if (se.date >= cutoffIso) return true;
+  return false;
 }
 // Single source of truth for "does this student belong on a pending/overdue fee list" — has the
 // student attended at least one session within the last 2 months (from asOf)? Used by the Pending
@@ -443,20 +530,15 @@ function isPendingForFees(data, student, asOf) {
 // Latest session date the student has a "Present" attendance record for, or null if never.
 function lastAttendedDate(data, studentId) {
   let latest = null;
-  for (const a of data.attendance) {
-    if (a.studentId !== studentId || a.status !== "P") continue;
-    const session = data.sessions.find((se) => se.id === a.sessionId);
-    if (session && (!latest || session.date > latest)) latest = session.date;
+  for (const se of presentSessionsFor(data, studentId).values()) {
+    if (!latest || se.date > latest) latest = se.date;
   }
   return latest;
 }
 // True if the student has at least one "Present" record on a session dated after cutoffDate.
 function hasAttendedAfter(data, studentId, cutoffDate) {
-  return data.attendance.some((a) => {
-    if (a.studentId !== studentId || a.status !== "P") return false;
-    const session = data.sessions.find((se) => se.id === a.sessionId);
-    return session && session.date > cutoffDate;
-  });
+  for (const se of presentSessionsFor(data, studentId).values()) if (se.date > cutoffDate) return true;
+  return false;
 }
 // True if any player has been marked "Present" for this session. Used to block
 // deleting a session from Training Schedules once real attendance history exists
@@ -600,6 +682,32 @@ function DateInput({ value, onChange, className = "", min, max }) {
   );
 }
 
+// Sizes a scrollable list box so it fills the space left below it in the window (with the
+// page scrolled to the top), so search/filters above stay visible and only the list scrolls.
+// Never shrinks below LIST_MIN_HEIGHT so small phones still show a usable number of rows.
+const LIST_MIN_HEIGHT = 320;
+const LIST_BOTTOM_GAP = 36; // matches .sa-content bottom padding
+function useFillRemainingHeight(deps) {
+  const ref = useRef(null);
+  const [maxHeight, setMaxHeight] = useState(null);
+  useLayoutEffect(() => {
+    const calc = () => {
+      const el = ref.current;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      setMaxHeight(Math.max(LIST_MIN_HEIGHT, Math.floor(window.innerHeight - top - LIST_BOTTOM_GAP)));
+    };
+    calc();
+    window.addEventListener("resize", calc);
+    return () => window.removeEventListener("resize", calc);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+  return [ref, maxHeight];
+}
+function ListCount({ shown, total }) {
+  return <div className="sa-list-count">Showing {shown} of {total} players</div>;
+}
+
 function EmptyState({ icon: Icon, title, message }) {
   return (
     <div className="sa-empty">
@@ -633,7 +741,7 @@ function Sidebar({ view, setView, collapsed, setCollapsed, currentRole, adminNam
           </button>
         </div>
         <nav className="sa-nav">
-          {NAV_ITEMS.filter((item) => !item.superAdminOnly || currentRole === "super_admin").map((item) => {
+          {NAV_ITEMS.filter((item) => canAccessView(currentRole, item.id)).map((item) => {
             const Icon = item.icon;
             const active = view === item.id;
             return (
@@ -1641,6 +1749,7 @@ function StudentsPage({ data, refetchData, locationId }) {
 
   const openAdd = () => setModal({ mode: "add" });
   const openEdit = (s) => setModal({ mode: "edit", id: s.id, initial: s });
+  const [listRef, listMaxHeight] = useFillRemainingHeight([filtered.length === 0, locationId]);
 
   const save = async (form) => {
     if (savingRef.current) return;
@@ -1709,7 +1818,9 @@ function StudentsPage({ data, refetchData, locationId }) {
       {filtered.length === 0 ? (
         <EmptyState icon={UserRound} title="No players found" message="Try adjusting filters or add a new player." />
       ) : (
-        <div className="sa-table-wrap">
+        <>
+        <ListCount shown={filtered.length} total={locationStudents.length} />
+        <div className="sa-table-wrap sa-list-scroll" ref={listRef} style={listMaxHeight ? { maxHeight: listMaxHeight } : undefined}>
           <table className="sa-table sa-table-compact">
             <thead>
               <tr>
@@ -1743,6 +1854,7 @@ function StudentsPage({ data, refetchData, locationId }) {
             </tbody>
           </table>
         </div>
+        </>
       )}
 
       {modal && (
@@ -1827,6 +1939,9 @@ function AttendancePage({ data, refetchData, locationId }) {
     return s.name.toLowerCase().includes(q) || (s.jerseyName || "").toLowerCase().includes(q) || String(s.jerseyNo).toLowerCase().includes(q);
   });
 
+  const locationTotal = data.students.filter((s) => locationId === "ALL" || s.locationId === locationId).length;
+  const [listRef, listMaxHeight] = useFillRemainingHeight([students.length === 0, locationId, saveError]);
+
   const clearPendingIfCurrent = (studentId, status) => {
     if (pendingStatusRef.current[studentId] !== status) return;
     const next = { ...pendingStatusRef.current };
@@ -1908,7 +2023,9 @@ function AttendancePage({ data, refetchData, locationId }) {
       {students.length === 0 ? (
         <EmptyState icon={ClipboardList} title="No players found" message="Try adjusting filters." />
       ) : (
-        <div className="sa-table-wrap sa-attendance-scroll">
+        <>
+        <ListCount shown={students.length} total={locationTotal} />
+        <div className="sa-table-wrap sa-attendance-scroll sa-list-scroll" ref={listRef} style={listMaxHeight ? { maxHeight: listMaxHeight } : undefined}>
           <table className="sa-table sa-table-compact sa-attendance-table">
             <thead>
               <tr>
@@ -1951,6 +2068,7 @@ function AttendancePage({ data, refetchData, locationId }) {
             </tbody>
           </table>
         </div>
+        </>
       )}
     </div>
   );
@@ -2747,7 +2865,7 @@ function RecordPaymentForm({ initial, submitting, onCancel, onSave }) {
   );
 }
 
-function FeeUpdatePage({ data, refetchData, locationId }) {
+function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [payModal, setPayModal] = useState(false);
@@ -2766,9 +2884,32 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
     return () => clearTimeout(t);
   }, [successMessage]);
 
+  // Memoized so typing in the search box doesn't recompute the Pending/Paid lists (which
+  // walk fee + attendance history for every player at the location) on each keystroke.
+  // Each list is only built while its card is expanded.
+  const students = useMemo(
+    () => data.students.filter((s) => s.locationId === locationId),
+    [data.students, locationId]
+  );
+  const pendingStudents = useMemo(() => {
+    if (!showBulk) return [];
+    return students
+      .filter((s) => studentFeeStatus(data, s) !== "Paid")
+      .map((s) => ({ s, status: studentFeeStatus(data, s), last: latestPayment(data, s.id), sessionsOverdue: sessionsOverdueCountFor(data, s) }))
+      // Same isPendingForFees rule as the Reports > Pending Fees report and the dashboard's
+      // outstanding figure, so all three stay in sync: a student whose next payment date is
+      // more than 2 months back and who hasn't attended any session since is excluded here too.
+      .filter(({ s }) => isPendingForFees(data, s));
+  }, [data, students, showBulk]);
+  const paidStudents = useMemo(() => {
+    if (!showPaid) return [];
+    return students
+      .filter((s) => studentFeeStatus(data, s) === "Paid")
+      .map((s) => ({ s, last: latestPayment(data, s.id) }));
+  }, [data, students, showPaid]);
+
   if (!locationId) return <EmptyState icon={Receipt} title="No location selected" message="Add a location first." />;
 
-  const students = data.students.filter((s) => s.locationId === locationId);
   const q = search.trim().toLowerCase();
   const matches = q ? students.filter((s) => s.name.toLowerCase().includes(q) || (s.jerseyName || "").toLowerCase().includes(q) || String(s.jerseyNo).toLowerCase().includes(q)) : [];
   const selected = students.find((s) => s.id === selectedId);
@@ -2791,7 +2932,7 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
       });
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await refetchData();
+      await (refetchPayments || refetchData)();
       setPayModal(false);
       setSuccessMessage("Payment recorded successfully.");
     } finally {
@@ -2819,7 +2960,7 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
         .eq("id", editingPayment.payment.id);
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await refetchData();
+      await (refetchPayments || refetchData)();
       setEditingPayment(null);
       setSuccessMessage("Payment updated successfully.");
     } finally {
@@ -2827,18 +2968,6 @@ function FeeUpdatePage({ data, refetchData, locationId }) {
       setPaySubmitting(false);
     }
   };
-
-  const pendingStudents = students
-    .filter((s) => studentFeeStatus(data, s) !== "Paid")
-    .map((s) => ({ s, status: studentFeeStatus(data, s), last: latestPayment(data, s.id), sessionsOverdue: sessionsOverdueCountFor(data, s) }))
-    // Same isPendingForFees rule as the Reports > Pending Fees report and the dashboard's
-    // outstanding figure, so all three stay in sync: a student whose next payment date is
-    // more than 2 months back and who hasn't attended any session since is excluded here too.
-    .filter(({ s }) => isPendingForFees(data, s));
-
-  const paidStudents = students
-    .filter((s) => studentFeeStatus(data, s) === "Paid")
-    .map((s) => ({ s, last: latestPayment(data, s.id) }));
 
   return (
     <div className="sa-page">
@@ -3242,19 +3371,49 @@ function ReportFeeList({ data }) {
   const rowFor = (s) => {
     const monthPayments = data.payments.filter((p) => p.studentId === s.id && monthKey(p.date) === month);
     const coveringPayment = studentPayments(data, s.id).find((p) => p.endDate && monthKey(p.endDate) === month);
-    const amountPaid = monthPayments.length > 0
-      ? monthPayments.reduce((a, p) => a + Number(p.amount), 0)
-      : Number(coveringPayment?.amount || 0);
     const last = monthPayments.sort((a, b) => (a.date < b.date ? 1 : -1))[0] || coveringPayment || latestPayment(data, s.id);
-    const paid = studentFeeStatus(data, s) === "Paid";
+    // Paid/Unpaid, Amount Paid and Due Amount all reflect the SELECTED month (not today's status,
+    // and not the date money was received). A Fee payment is "for" a month if its payment_month
+    // ("MM/YYYY") is that month, or its start/end coverage period includes that month. A cycle's
+    // end month only counts when the cycle runs to the end of that month (day 28+), so a mid-month
+    // cycle (e.g. 18 Sep - 14 Oct) covers September only, not October. A payment covering several
+    // months (e.g. 4 Months: AED 1,600 for Mar-Jun) is split evenly, so each month shows AED 400.
+    const monthsCoveredBy = (p) => {
+      const months = new Set();
+      if (/^\d{2}\/\d{4}$/.test(p.paymentMonth || "")) months.add(`${p.paymentMonth.slice(3)}-${p.paymentMonth.slice(0, 2)}`);
+      if (p.startDate && p.endDate) {
+        const endM = monthKey(p.endDate);
+        const endCounts = Number(p.endDate.slice(8, 10)) >= 28;
+        for (let m = monthKey(p.startDate); m < endM || (m === endM && endCounts); m = monthKey(shiftMonths(`${m}-01`, 1))) {
+          months.add(m);
+        }
+      }
+      return months;
+    };
+    const paymentsForMonth = data.payments
+      .filter((p) => p.studentId === s.id && p.paymentType === "Fee")
+      .map((p) => ({ p, months: monthsCoveredBy(p) }))
+      .filter(({ months }) => months.has(month));
+    const paid = paymentsForMonth.length > 0;
+    const amountPaid = Math.round(paymentsForMonth.reduce((sum, { p, months }) => sum + Number(p.amount || 0) / months.size, 0) * 100) / 100;
     const dueAmount = paid ? 0 : studentExpectedFee(data, s);
-    return { s, paid, amountPaid, receiptNo: last?.receiptNo || "\u2014", nextDue: last?.nextPaymentDate, dueAmount: Math.max(dueAmount, 0) };
+    const sessionsAttended = sessionsCountForStudentInMonth(data, s.id, month);
+    // Has a Fee payment for the selected month: payment_month is this month ("MM/YYYY"), it was
+    // paid in this month, or this month falls inside its start/end coverage period.
+    const feeMonthKey = `${month.slice(5, 7)}/${month.slice(0, 4)}`; // "YYYY-MM" -> "MM/YYYY"
+    const paidForMonth = data.payments.some((p) => p.studentId === s.id && p.paymentType === "Fee" && (
+      p.paymentMonth === feeMonthKey ||
+      monthKey(p.date) === month ||
+      (p.startDate && p.endDate && monthKey(p.startDate) <= month && monthKey(p.endDate) >= month)
+    ));
+    return { s, paid, amountPaid, receiptNo: last?.receiptNo || "\u2014", nextDue: last?.nextPaymentDate, dueAmount: Math.max(dueAmount, 0), sessionsAttended, paidForMonth };
   };
-  const rows = students.map(rowFor);
+  // Players appear if they attended at least one session OR paid a fee for the selected month.
+  const rows = students.map(rowFor).filter((r) => r.sessionsAttended > 0 || r.paidForMonth);
 
   const exportExcel = () => {
-    const headers = ["Player Name", "Jersey Name", "Jersey No.", "Contact", "Player Status", "Status", "Amount Paid", "Receipt No.", "Next Payment Date", "Due Amount"];
-    const data_ = rows.map((r) => [r.s.name, r.s.jerseyName, r.s.jerseyNo, r.s.phone, r.s.status, r.paid ? "Paid" : "Unpaid", r.amountPaid, r.receiptNo, fmtDate(r.nextDue), r.dueAmount]);
+    const headers = ["Player Name", "Jersey Name", "Jersey No.", "Contact", "Player Status", "Sessions Attended", "Status", "Amount Paid", "Receipt No.", "Next Payment Date", "Due Amount"];
+    const data_ = rows.map((r) => [r.s.name, r.s.jerseyName, r.s.jerseyNo, r.s.phone, r.s.status, r.sessionsAttended, r.paid ? "Paid" : "Unpaid", r.amountPaid, r.receiptNo, fmtDate(r.nextDue), r.dueAmount]);
     downloadXLSX("fee-list-report.xlsx", headers, data_);
   };
 
@@ -3282,15 +3441,16 @@ function ReportFeeList({ data }) {
       </div>
       <div className="sa-table-wrap">
         <table className="sa-table sa-table-compact">
-          <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Contact</th><th>Player Status</th><th>Status</th><th>Amount Paid</th><th>Receipt No.</th><th>Next Due</th><th>Due Amount</th></tr></thead>
+          <thead><tr><th>Player</th><th>Jersey Name</th><th>Jersey No.</th><th>Contact</th><th>Player Status</th><th>Sessions</th><th>Status</th><th>Amount Paid</th><th>Receipt No.</th><th>Next Due</th><th>Due Amount</th></tr></thead>
           <tbody>
-            {rows.map(({ s, paid, amountPaid, receiptNo, nextDue, dueAmount }) => (
+            {rows.map(({ s, paid, amountPaid, receiptNo, nextDue, dueAmount, sessionsAttended }) => (
               <tr key={s.id} className={paid ? "sa-row-paid" : "sa-row-unpaid"}>
                 <td className="sa-td-strong">{s.name}</td>
                 <td>{s.jerseyName || "\u2014"}</td>
                 <td>#{s.jerseyNo}</td>
                 <td>{s.phone}</td>
                 <td><Pill tone={s.status === "Active" ? "teal" : "red"}>{s.status}</Pill></td>
+                <td className="sa-mono">{sessionsAttended}</td>
                 <td><Pill tone={paid ? "teal" : "red"}>{paid ? "Paid" : "Unpaid"}</Pill></td>
                 <td className="sa-mono">{money(amountPaid)}</td>
                 <td className="sa-mono">{receiptNo}</td>
@@ -3801,6 +3961,18 @@ export default function App() {
     }
   }, []);
 
+  // Lighter refresh for Fee Update saves: only the payments table changes there.
+  // Falls back to a full reload if the partial one fails.
+  const refetchPayments = useCallback(async () => {
+    try {
+      const payments = await loadPayments();
+      setData((prev) => (prev ? { ...prev, payments } : prev));
+      setDataError(null);
+    } catch {
+      await refetchData();
+    }
+  }, [refetchData]);
+
   useEffect(() => {
     // Number inputs change value on scroll when focused, which is easy to trigger by
     // accident while scrolling the page — blur before the browser applies the scroll delta.
@@ -3873,6 +4045,12 @@ export default function App() {
   }, [adminProfile, refetchData]);
 
   const currentRole = adminProfile?.role || "location_admin";
+  // A location_admin only gets Players, Attendance and Fee Update; anything else
+  // (including the initial "dashboard" view) falls back to their default page.
+  const activeView = canAccessView(currentRole, view) ? view : defaultViewFor(currentRole);
+  useEffect(() => {
+    if (adminProfile && view !== activeView) setView(activeView);
+  }, [adminProfile, view, activeView]);
 
   useEffect(() => {
     if (!data) return;
@@ -3946,30 +4124,30 @@ export default function App() {
     <div className="sa-root">
       <style>{STYLES}</style>
       <Sidebar
-        view={view} setView={setView} collapsed={collapsed} setCollapsed={setCollapsed}
+        view={activeView} setView={setView} collapsed={collapsed} setCollapsed={setCollapsed}
         currentRole={currentRole} adminName={adminProfile.name} onSignOut={handleSignOut}
         mobileOpen={mobileNavOpen} onCloseMobile={() => setMobileNavOpen(false)}
       />
       <div className="sa-main">
         <Topbar
-          view={view} data={data} locationId={locationId} setLocationId={setLocationId}
+          view={activeView} data={data} locationId={locationId} setLocationId={setLocationId}
           onOpenMobileNav={() => setMobileNavOpen(true)}
         />
         <div className="sa-content">
           {dataError && (
             <div className="sa-storage-warning"><AlertCircle size={14} /> {dataError}</div>
           )}
-          {view === "dashboard" && <DashboardPage data={data} dashLocationId={dashLocationId} setDashLocationId={setDashLocationId} />}
-          {view === "locations" && <LocationsPage data={data} refetchData={refetchData} />}
-          {view === "paymentPlans" && <PaymentPlansPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "batches" && <BatchesPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "students" && <StudentsPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "attendance" && <AttendancePage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "coaches" && <CoachesPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "schedules" && <SchedulesPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "feeUpdate" && <FeeUpdatePage data={data} refetchData={refetchData} locationId={locationId} />}
-          {view === "reports" && <ReportsPage data={data} />}
-          {view === "manageAdmins" && <ManageAdminsPage currentRole={currentRole} />}
+          {activeView === "dashboard" && <DashboardPage data={data} dashLocationId={dashLocationId} setDashLocationId={setDashLocationId} />}
+          {activeView === "locations" && <LocationsPage data={data} refetchData={refetchData} />}
+          {activeView === "paymentPlans" && <PaymentPlansPage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "batches" && <BatchesPage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "students" && <StudentsPage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "attendance" && <AttendancePage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "coaches" && <CoachesPage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "schedules" && <SchedulesPage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "feeUpdate" && <FeeUpdatePage data={data} refetchData={refetchData} refetchPayments={refetchPayments} locationId={locationId} />}
+          {activeView === "reports" && <ReportsPage data={data} />}
+          {activeView === "manageAdmins" && <ManageAdminsPage currentRole={currentRole} />}
         </div>
       </div>
     </div>
@@ -4325,8 +4503,11 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
 .sa-att-toggle-p.sa-att-toggle-active { background: #14B8A6; color: #ffffff; }
 .sa-att-toggle-a.sa-att-toggle-active { background: #EF4444; color: #ffffff; }
 
-.sa-attendance-scroll { max-height: 722px; overflow-y: auto; }
-.sa-attendance-scroll thead th { position: sticky; top: 0; z-index: 1; }
+/* Scrollable player lists (Players, Attendance). Height is set inline to fill the rest of the
+   window; the max-height here is only a fallback before that's measured. */
+.sa-list-scroll { max-height: max(320px, calc(100vh - 300px)); overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.sa-list-scroll thead th { position: sticky; top: 0; z-index: 1; }
+.sa-list-count { font-size: 12px; color: var(--muted); margin-bottom: -6px; }
 
 /* ---------- Fee Update ---------- */
 .sa-search-results { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
@@ -4379,6 +4560,5 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
   .sa-attendance-table th:nth-child(6), .sa-attendance-table td:nth-child(6) { width: 29%; }
   .sa-attendance-table .sa-att-toggle-btn { padding: 5px 8px; }
   .sa-attendance-table .sa-pill { padding: 2px 5px; font-size: 9px; margin-left: 0; }
-  .sa-attendance-scroll { max-height: 639px; }
 }
 `;
