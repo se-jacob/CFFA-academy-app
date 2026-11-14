@@ -3,7 +3,7 @@ import {
   LayoutDashboard, MapPin, Wallet, Layers, Users, Calendar as CalendarIcon,
   Receipt, FileBarChart, Plus, Pencil, Trash2, X, Search, ChevronLeft,
   ChevronRight, Download, Check, AlertCircle, Clock, TrendingUp,
-  UserRound, Phone, Mail, Menu, ClipboardList, MessageSquare, ShieldCheck, ShieldOff, UserX
+  UserRound, Phone, Mail, Menu, ClipboardList, MessageSquare, ShieldCheck, ShieldOff, UserX, UserCheck
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -30,15 +30,18 @@ const NAV_ITEMS = [
   { id: "batches", label: "Batches", icon: Layers },
   { id: "students", label: "Players", icon: UserRound },
   { id: "attendance", label: "Attendance", icon: ClipboardList },
+  { id: "coachAttendance", label: "Coach Attendance", icon: UserCheck },
   { id: "coaches", label: "Coaches", icon: Users },
   { id: "schedules", label: "Training Schedules", icon: CalendarIcon },
   { id: "feeUpdate", label: "Fee Update", icon: Receipt },
   { id: "reports", label: "Reports", icon: FileBarChart },
   { id: "manageAdmins", label: "Manage Admins", icon: ShieldCheck, superAdminOnly: true },
 ];
-const LOCATION_SCOPED = new Set(["paymentPlans", "batches", "students", "attendance", "coaches", "schedules", "feeUpdate"]);
+const LOCATION_SCOPED = new Set(["paymentPlans", "batches", "students", "attendance", "coaches", "schedules", "feeUpdate", "coachAttendance"]);
 // Pages a location_admin may open. super_admin can open everything.
-const LOCATION_ADMIN_VIEWS = new Set(["students", "attendance", "feeUpdate"]);
+const LOCATION_ADMIN_VIEWS = new Set(["students", "attendance", "feeUpdate", "coachAttendance"]);
+// Pages that work on a phone. On a phone, anything else is shown greyed out under "Laptop only".
+const PHONE_VIEWS = new Set(["dashboard", "students", "attendance", "feeUpdate", "coachAttendance"]);
 function canAccessView(role, viewId) {
   return role === "super_admin" || LOCATION_ADMIN_VIEWS.has(viewId);
 }
@@ -212,7 +215,7 @@ async function fetchAllRows(table, { orderBy = ["id"] } = {}) {
 async function loadAllData() {
   const [
     locationsRes, paymentPlansRes, batchesRes, coachesRes, coachLocationsRes,
-    studentsRes, sessionsRes, sessionCoachesRes, attendanceRes, paymentsRes,
+    studentsRes, sessionsRes, sessionCoachesRes, attendanceRes, paymentsRes, coachAttendanceRes,
   ] = await Promise.all([
     fetchAllRows("locations", { orderBy: ["name", "id"] }),
     fetchAllRows("payment_plans"),
@@ -224,6 +227,7 @@ async function loadAllData() {
     fetchAllRows("session_coaches", { orderBy: ["session_id", "coach_id"] }),
     fetchAllRows("attendance"),
     fetchAllRows("payments"),
+    loadCoachAttendance(),
   ]);
 
   const firstError = [
@@ -278,7 +282,28 @@ async function loadAllData() {
   }));
   const payments = (paymentsRes.data || []).map(mapPaymentRow);
 
-  return { locations, paymentPlans, batches, coaches, students, sessions, attendance, payments };
+  return {
+    locations, paymentPlans, batches, coaches, students, sessions, attendance, payments,
+    coachAttendance: coachAttendanceRes.rows, coachAttendanceMissing: coachAttendanceRes.missing,
+  };
+}
+
+// coach_attendance is created by supabase/migrations_manual/create_coach_attendance.sql. Until that
+// script has been run, the table doesn't exist — treat that as "no records" (and flag it) rather
+// than failing the whole app load.
+async function loadCoachAttendance() {
+  const res = await fetchAllRows("coach_attendance");
+  if (res.error) {
+    const msg = `${res.error.code || ""} ${res.error.message || ""}`;
+    if (/42P01|PGRST205|coach_attendance/i.test(msg)) return { rows: [], missing: true };
+    throw res.error;
+  }
+  return {
+    rows: (res.data || []).map((r) => ({
+      id: r.id, coachId: r.coach_id, locationId: r.location_id, date: r.date, sessions: Number(r.sessions_count) || 0,
+    })),
+    missing: false,
+  };
 }
 
 function mapPaymentRow(p) {
@@ -695,7 +720,8 @@ function useFillRemainingHeight(deps) {
       const el = ref.current;
       if (!el) return;
       const top = el.getBoundingClientRect().top + window.scrollY;
-      setMaxHeight(Math.max(LIST_MIN_HEIGHT, Math.floor(window.innerHeight - top - LIST_BOTTOM_GAP)));
+      const minHeight = Math.min(LIST_MIN_HEIGHT, Math.round(window.innerHeight * 0.6));
+      setMaxHeight(Math.max(minHeight, Math.floor(window.innerHeight - top - LIST_BOTTOM_GAP)));
     };
     calc();
     window.addEventListener("resize", calc);
@@ -706,6 +732,63 @@ function useFillRemainingHeight(deps) {
 }
 function ListCount({ shown, total }) {
   return <div className="sa-list-count">Showing {shown} of {total} players</div>;
+}
+
+// Phones (upright or sideways) and small upright tablets get card lists instead of wide tables;
+// larger screens keep the tables exactly as they were. Keep in sync with the phone @media block in STYLES.
+const PHONE_QUERY = "(max-width: 700px), (max-height: 500px) and (pointer: coarse)";
+function useIsPhone() {
+  const [isPhone, setIsPhone] = useState(() => typeof window !== "undefined" && !!window.matchMedia && window.matchMedia(PHONE_QUERY).matches);
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mq = window.matchMedia(PHONE_QUERY);
+    const onChange = () => setIsPhone(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return isPhone;
+}
+function feeTone(status) {
+  return status === "Paid" ? "teal" : status === "Overdue" ? "red" : "amber";
+}
+// tel: link for a stored phone number (keeps digits and a leading +), or null if there's no number.
+function telHref(phone) {
+  const digits = String(phone || "").replace(/[^\d+]/g, "");
+  return digits ? `tel:${digits}` : null;
+}
+function CallButton({ phone, name }) {
+  const href = telHref(phone);
+  if (!href) return null;
+  return (
+    <a className="sa-icon-btn sa-touch-btn" href={href} onClick={(e) => e.stopPropagation()} aria-label={`Call ${name}`} title={`Call ${phone}`}>
+      <Phone size={17} />
+    </a>
+  );
+}
+// Fee history as stacked cards (phones): amount · mode · payment date, then the period covered, then the next due date.
+// renderActions(payment, index) adds optional buttons.
+// Phones show only the most recent few payments (payments arrive newest first); laptops show the full table.
+const PHONE_PAYMENT_LIMIT = 4;
+function PaymentCards({ payments, renderActions }) {
+  return (
+    <div className="sa-mcard-list sa-mcard-list-bordered">
+      {payments.slice(0, PHONE_PAYMENT_LIMIT).map((p, i) => (
+        <div key={p.id} className="sa-mcard">
+          <div className="sa-mcard-row">
+            <div className="sa-mcard-main">
+              <div className="sa-mcard-name"><span className="sa-mono">{money(p.amount)}</span><span className="sa-mcard-muted"> {"\u00b7"} {p.paymentMode || "\u2014"} {"\u00b7"} {fmtDate(p.date)}</span></div>
+              {(p.startDate || p.endDate) && (
+                <div className="sa-mcard-sub">Covers {p.startDate ? fmtDate(p.startDate) : "\u2014"} to {p.endDate ? fmtDate(p.endDate) : "\u2014"}</div>
+              )}
+              {p.nextPaymentDate && <div className="sa-mcard-sub">Next due {fmtDate(p.nextPaymentDate)}</div>}
+            </div>
+            {renderActions && <div className="sa-mcard-actions">{renderActions(p, i)}</div>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function EmptyState({ icon: Icon, title, message }) {
@@ -720,7 +803,11 @@ function EmptyState({ icon: Icon, title, message }) {
 
 /* ============================== SHELL ============================== */
 
-function Sidebar({ view, setView, collapsed, setCollapsed, currentRole, adminName, onSignOut, mobileOpen, onCloseMobile }) {
+function Sidebar({ view, setView, collapsed, setCollapsed, currentRole, adminName, onSignOut, mobileOpen, onCloseMobile, isPhone, onUnavailable }) {
+  const allowed = NAV_ITEMS.filter((item) => canAccessView(currentRole, item.id));
+  // On a phone, pages that don't work there are listed separately, greyed out, under "Laptop only".
+  const usable = isPhone ? allowed.filter((item) => PHONE_VIEWS.has(item.id)) : allowed;
+  const laptopOnly = isPhone ? allowed.filter((item) => !PHONE_VIEWS.has(item.id)) : [];
   return (
     <>
       <div
@@ -741,7 +828,7 @@ function Sidebar({ view, setView, collapsed, setCollapsed, currentRole, adminNam
           </button>
         </div>
         <nav className="sa-nav">
-          {NAV_ITEMS.filter((item) => canAccessView(currentRole, item.id)).map((item) => {
+          {usable.map((item) => {
             const Icon = item.icon;
             const active = view === item.id;
             return (
@@ -757,6 +844,26 @@ function Sidebar({ view, setView, collapsed, setCollapsed, currentRole, adminNam
               </button>
             );
           })}
+          {laptopOnly.length > 0 && (
+            <>
+              <div className="sa-nav-group-label">Laptop only</div>
+              {laptopOnly.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.id}
+                    className="sa-nav-item sa-nav-item-disabled"
+                    aria-disabled="true"
+                    onClick={() => { onUnavailable(item.label); onCloseMobile(); }}
+                    title={`${item.label} is only available on a laptop or desktop`}
+                  >
+                    <Icon size={18} strokeWidth={2} />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </>
+          )}
         </nav>
         {!collapsed && (
           <div className="sa-sidebar-footer">
@@ -806,6 +913,11 @@ function Topbar({ view, data, locationId, setLocationId, onOpenMobileNav }) {
 /* ============================== DASHBOARD ============================== */
 
 function DashboardPage({ data, dashLocationId, setDashLocationId }) {
+  const isPhone = useIsPhone();
+  // Phones: smaller axis text, every location label shown and long names shortened.
+  const phoneAxis = isPhone
+    ? { interval: 0, tickFormatter: (v) => (String(v).length > 10 ? `${String(v).slice(0, 9)}\u2026` : v) }
+    : {};
   const scopedStudents = useMemo(
     () => data.students.filter((s) => dashLocationId === "ALL" || s.locationId === dashLocationId),
     [data.students, dashLocationId]
@@ -902,7 +1014,25 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
 
   return (
     <div className="sa-page">
-      <div className="sa-scoreboard">
+      {/* On phones "This Week's Schedule" (which holds this filter on laptops) is hidden, so the
+          same location filter sits above the tiles instead. */}
+      {isPhone && (
+        <div className="sa-dash-phone-filter">
+          <MapPin size={15} />
+          <select
+            className="sa-inline-select"
+            value={dashLocationId}
+            onChange={(e) => setDashLocationId(e.target.value)}
+            aria-label="Dashboard location"
+          >
+            <option value="ALL">All Locations</option>
+            {data.locations.map((l) => (
+              <option key={l.id} value={l.id}>{l.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      <div className="sa-scoreboard sa-scoreboard-compact">
         <ScoreCard
           label="Players"
           value={scopedStudents.length}
@@ -947,11 +1077,11 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
             <ResponsiveContainer>
               <BarChart data={combinedByLocation} margin={{ top: 28, right: 8, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#EAEAE5" vertical={false} />
-                <XAxis dataKey="name" tick={{ fontSize: 12, fill: "#6B7280" }} axisLine={false} tickLine={false} />
+                <XAxis dataKey="name" tick={{ fontSize: isPhone ? 10 : 12, fill: "#6B7280" }} axisLine={false} tickLine={false} {...phoneAxis} />
                 {/* domain headroom so the on-bar total label (rendered above the tallest bar) has
                     room to draw instead of being clipped by the chart's top edge */}
-                <YAxis yAxisId="left" domain={[0, (dataMax) => Math.ceil(dataMax * 1.15)]} tick={{ fontSize: 12, fill: "#6B7280" }} axisLine={false} tickLine={false} />
-                <YAxis yAxisId="right" orientation="right" allowDecimals={false} tick={{ fontSize: 12, fill: "#6B7280" }} axisLine={false} tickLine={false} />
+                <YAxis yAxisId="left" domain={[0, (dataMax) => Math.ceil(dataMax * 1.15)]} tick={{ fontSize: isPhone ? 10 : 12, fill: "#6B7280" }} axisLine={false} tickLine={false} {...(isPhone ? { width: 44 } : {})} />
+                <YAxis yAxisId="right" orientation="right" allowDecimals={false} tick={{ fontSize: isPhone ? 10 : 12, fill: "#6B7280" }} axisLine={false} tickLine={false} {...(isPhone ? { width: 44 } : {})} />
                 <Tooltip
                   formatter={(v, name) => {
                     if (name === "paid") return [money(v), "Paid"];
@@ -961,7 +1091,7 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
                   contentStyle={{ borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13, fontFamily: "Inter" }}
                 />
                 <Legend
-                  wrapperStyle={{ fontSize: 12 }}
+                  wrapperStyle={{ fontSize: isPhone ? 11 : 12 }}
                   formatter={(value) => (value === "paid" ? "Paid" : value === "outstanding" ? "Outstanding" : "Players Attended")}
                 />
                 <Bar yAxisId="left" dataKey="paid" stackId="revenue" name="paid" fill="#14B8A6" radius={isTrendCurrentMonth ? [0, 0, 6, 6] : [6, 6, 0, 0]}>
@@ -992,11 +1122,11 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
             <ResponsiveContainer>
               <BarChart data={revenueEnrollByLocation} margin={{ top: 28, right: 8, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#EAEAE5" vertical={false} />
-                <XAxis dataKey="name" tick={{ fontSize: 12, fill: "#6B7280" }} axisLine={false} tickLine={false} />
+                <XAxis dataKey="name" tick={{ fontSize: isPhone ? 10 : 12, fill: "#6B7280" }} axisLine={false} tickLine={false} {...phoneAxis} />
                 {/* domain headroom on both axes so the on-bar total labels (rendered above the
                     tallest bar on each side) have room to draw instead of being clipped */}
-                <YAxis yAxisId="left" domain={[0, (dataMax) => Math.ceil(dataMax * 1.15)]} tick={{ fontSize: 12, fill: "#6B7280" }} axisLine={false} tickLine={false} />
-                <YAxis yAxisId="right" orientation="right" allowDecimals={false} domain={[0, (dataMax) => Math.ceil(dataMax * 1.15)]} tick={{ fontSize: 12, fill: "#6B7280" }} axisLine={false} tickLine={false} />
+                <YAxis yAxisId="left" domain={[0, (dataMax) => Math.ceil(dataMax * 1.15)]} tick={{ fontSize: isPhone ? 10 : 12, fill: "#6B7280" }} axisLine={false} tickLine={false} {...(isPhone ? { width: 44 } : {})} />
+                <YAxis yAxisId="right" orientation="right" allowDecimals={false} domain={[0, (dataMax) => Math.ceil(dataMax * 1.15)]} tick={{ fontSize: isPhone ? 10 : 12, fill: "#6B7280" }} axisLine={false} tickLine={false} {...(isPhone ? { width: 44 } : {})} />
                 <Tooltip
                   formatter={(v, name) => {
                     if (name === "registrationFee") return [money(v), "Registration Fee"];
@@ -1013,7 +1143,7 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
                   contentStyle={{ borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13, fontFamily: "Inter" }}
                 />
                 <Legend
-                  wrapperStyle={{ fontSize: 12 }}
+                  wrapperStyle={{ fontSize: isPhone ? 11 : 12 }}
                   formatter={(value) => ({
                     registrationFee: "Registration Fee",
                     sessionFees: "Session Fees",
@@ -1041,6 +1171,8 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
           )}
         </div>
 
+        {/* Not shown on phones — the 7-day grid needs a wider screen. */}
+        {!isPhone && (
         <div className="sa-card">
           <div className="sa-card-header">
             <h3>This Week's Schedule</h3>
@@ -1074,6 +1206,7 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
             ))}
           </div>
         </div>
+        )}
       </div>
     </div>
   );
@@ -1550,6 +1683,8 @@ function StudentDetail({ data, student, onClose }) {
   const plan = studentPlan(data, student);
   const months = monthsBetween(shiftMonths(todayISO(), -5), todayISO());
   const status = studentFeeStatus(data, student);
+  const isPhone = useIsPhone();
+  const tel = telHref(student.phone);
 
   return (
     <Modal title={student.name} onClose={onClose} wide>
@@ -1563,7 +1698,7 @@ function StudentDetail({ data, student, onClose }) {
           <Pill tone={status === "Paid" ? "teal" : status === "Overdue" ? "red" : "amber"}>{status}</Pill>
         </div>
         <div className="sa-student-detail-grid">
-          <div><span>Phone</span><strong>{student.phone || "\u2014"}</strong></div>
+          <div><span>Phone</span><strong>{tel ? <a className="sa-tel-link" href={tel}>{student.phone}</a> : "\u2014"}</strong></div>
           <div><span>Email</span><strong>{student.email || "\u2014"}</strong></div>
           <div><span>DOB</span><strong>{fmtDate(student.dob)}</strong></div>
           <div><span>Sessions/Week</span><strong>{student.sessionsPerWeek}</strong></div>
@@ -1584,6 +1719,8 @@ function StudentDetail({ data, student, onClose }) {
         <h4 className="sa-section-title">Fee History</h4>
         {payments.length === 0 ? (
           <p className="sa-muted-text">No payments recorded yet.</p>
+        ) : isPhone ? (
+          <PaymentCards payments={payments} />
         ) : (
           <div className="sa-table-wrap">
             <table className="sa-table sa-table-compact">
@@ -1750,6 +1887,7 @@ function StudentsPage({ data, refetchData, locationId }) {
   const openAdd = () => setModal({ mode: "add" });
   const openEdit = (s) => setModal({ mode: "edit", id: s.id, initial: s });
   const [listRef, listMaxHeight] = useFillRemainingHeight([filtered.length === 0, locationId]);
+  const isPhone = useIsPhone();
 
   const save = async (form) => {
     if (savingRef.current) return;
@@ -1795,7 +1933,7 @@ function StudentsPage({ data, refetchData, locationId }) {
 
   return (
     <div className="sa-page">
-      <div className="sa-scoreboard">
+      <div className="sa-scoreboard sa-scoreboard-compact">
         <ScoreCard label="Active Players" value={activeTotal} icon={UserRound} accent="var(--teal)" />
         <ScoreCard label="Inactive Players" value={inactiveTotal} icon={UserRound} accent="var(--red)" />
       </div>
@@ -1821,6 +1959,34 @@ function StudentsPage({ data, refetchData, locationId }) {
         <>
         <ListCount shown={filtered.length} total={locationStudents.length} />
         <div className="sa-table-wrap sa-list-scroll" ref={listRef} style={listMaxHeight ? { maxHeight: listMaxHeight } : undefined}>
+          {isPhone ? (
+            <div className="sa-mcard-list">
+              {filtered.map((s) => {
+                const status = studentFeeStatus(data, s);
+                return (
+                  <div key={s.id} className="sa-mcard sa-row-clickable" onClick={() => setDetailId(s.id)}>
+                    <div className="sa-mcard-row">
+                      <div className="sa-mcard-main">
+                        <div className="sa-mcard-name">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</div>
+                      </div>
+                      <Pill tone={feeTone(status)}>{status}</Pill>
+                    </div>
+                    <div className="sa-mcard-row">
+                      <div className="sa-mcard-main sa-mcard-sub">{s.jerseyName || "\u2014"} {"\u00b7"} #{s.jerseyNo} {"\u00b7"} {batchName(data, s.batchId)}</div>
+                      <div className="sa-mcard-actions sa-mcard-actions-end" onClick={(e) => e.stopPropagation()}>
+                      <CallButton phone={s.phone} name={s.name} />
+                      {s.remark && s.remark.trim() && (
+                        <button className="sa-icon-btn sa-touch-btn" aria-label="View remark" onClick={() => setRemarkStudentId(s.id)}><MessageSquare size={17} /></button>
+                      )}
+                      <button className="sa-icon-btn sa-touch-btn" aria-label={`Edit ${s.name}`} onClick={() => openEdit(s)}><Pencil size={17} /></button>
+                      <button className="sa-icon-btn sa-touch-btn" aria-label={`Delete ${s.name}`} onClick={() => setConfirmDelete(s.id)}><Trash2 size={17} /></button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
           <table className="sa-table sa-table-compact">
             <thead>
               <tr>
@@ -1853,6 +2019,7 @@ function StudentsPage({ data, refetchData, locationId }) {
               })}
             </tbody>
           </table>
+          )}
         </div>
         </>
       )}
@@ -1941,6 +2108,7 @@ function AttendancePage({ data, refetchData, locationId }) {
 
   const locationTotal = data.students.filter((s) => locationId === "ALL" || s.locationId === locationId).length;
   const [listRef, listMaxHeight] = useFillRemainingHeight([students.length === 0, locationId, saveError]);
+  const isPhone = useIsPhone();
 
   const clearPendingIfCurrent = (studentId, status) => {
     if (pendingStatusRef.current[studentId] !== status) return;
@@ -1993,7 +2161,7 @@ function AttendancePage({ data, refetchData, locationId }) {
     <div className="sa-page">
       {saveError && <div className="sa-storage-warning"><AlertCircle size={14} /> {saveError}</div>}
       <div className="sa-page-actions">
-        <div className="sa-search-row">
+        <div className="sa-search-row sa-att-filters">
           <div className="sa-search-box" style={{ minWidth: "min(420px, 100%)" }}>
             <Search size={15} />
             <input placeholder="Search by name, jersey name, or jersey no." value={search} onChange={(e) => setSearch(e.target.value)} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} />
@@ -2016,7 +2184,7 @@ function AttendancePage({ data, refetchData, locationId }) {
         </div>
       </div>
 
-      <div className="sa-scoreboard">
+      <div className="sa-scoreboard sa-scoreboard-compact">
         <ScoreCard label="Players Present" value={presentCount} sub={`of ${students.length} shown for ${fmtDate(date)}`} icon={Check} accent="var(--teal)" />
       </div>
 
@@ -2026,6 +2194,41 @@ function AttendancePage({ data, refetchData, locationId }) {
         <>
         <ListCount shown={students.length} total={locationTotal} />
         <div className="sa-table-wrap sa-attendance-scroll sa-list-scroll" ref={listRef} style={listMaxHeight ? { maxHeight: listMaxHeight } : undefined}>
+          {isPhone ? (
+            <div className="sa-mcard-list">
+              {students.map((s) => {
+                const status = statusFor(s);
+                const feeStatus = studentFeeStatus(data, s);
+                return (
+                  <div key={s.id} className="sa-mcard">
+                    <div className="sa-mcard-row">
+                      <div className="sa-mcard-main">
+                        <div className="sa-mcard-name">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</div>
+                        <div className="sa-mcard-sub">{s.jerseyName || "\u2014"} {"\u00b7"} #{s.jerseyNo}</div>
+                        <div className="sa-mcard-sub"><Pill tone={feeTone(feeStatus)}>{feeStatus}</Pill> {batchName(data, s.batchId)}</div>
+                      </div>
+                      <div className="sa-att-toggle sa-att-toggle-lg">
+                        <button
+                          className={`sa-att-toggle-btn sa-att-toggle-p ${status === "P" ? "sa-att-toggle-active" : ""}`}
+                          onClick={() => markStatus(s, "P")}
+                          aria-label={`Mark ${s.name} present`}
+                        >
+                          <Check size={18} strokeWidth={3} />
+                        </button>
+                        <button
+                          className={`sa-att-toggle-btn sa-att-toggle-a ${status === "A" ? "sa-att-toggle-active" : ""}`}
+                          onClick={() => markStatus(s, "A")}
+                          aria-label={`Mark ${s.name} absent`}
+                        >
+                          <X size={18} strokeWidth={3} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
           <table className="sa-table sa-table-compact sa-attendance-table">
             <thead>
               <tr>
@@ -2067,6 +2270,7 @@ function AttendancePage({ data, refetchData, locationId }) {
               })}
             </tbody>
           </table>
+          )}
         </div>
         </>
       )}
@@ -2877,6 +3081,7 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
   const [successMessage, setSuccessMessage] = useState(null);
   const [paySubmitting, setPaySubmitting] = useState(false);
   const paySubmittingRef = useRef(false); // shared by record + update — only one of those modals is ever open at once
+  const isPhone = useIsPhone();
 
   useEffect(() => {
     if (!successMessage) return;
@@ -3017,6 +3222,20 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
           <h4 className="sa-section-title">Fee History</h4>
           {studentPayments(data, selected.id).length === 0 ? (
             <p className="sa-muted-text">No payments recorded yet.</p>
+          ) : isPhone ? (
+            <PaymentCards
+              payments={studentPayments(data, selected.id)}
+              renderActions={(p, i) => (
+                <>
+                  {p.comment && p.comment.trim() && (
+                    <button className="sa-icon-btn sa-touch-btn" aria-label="View comment" onClick={() => setViewCommentPayment(p)}><MessageSquare size={17} /></button>
+                  )}
+                  {i === 0 && (
+                    <button className="sa-icon-btn sa-touch-btn" aria-label="Edit latest payment" onClick={() => setEditingPayment({ student: selected, payment: p })}><Pencil size={17} /></button>
+                  )}
+                </>
+              )}
+            />
           ) : (
             <div className="sa-table-wrap">
               <table className="sa-table sa-table-compact">
@@ -3056,6 +3275,21 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
         {showBulk && (
           pendingStudents.length === 0 ? (
             <p className="sa-muted-text">Everyone at this location is paid up.</p>
+          ) : isPhone ? (
+            <div className="sa-mcard-list sa-mcard-list-bordered sa-mcard-scroll">
+              {pendingStudents.map(({ s, status, last, sessionsOverdue }) => (
+                <div key={s.id} className="sa-mcard sa-row-clickable" onClick={() => setSelectedId(s.id)}>
+                  <div className="sa-mcard-row">
+                    <div className="sa-mcard-main">
+                      <div className="sa-mcard-name">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</div>
+                      <div className="sa-mcard-sub">{s.jerseyName || "\u2014"} {"\u00b7"} #{s.jerseyNo} {"\u00b7"} {batchName(data, s.batchId)}</div>
+                      <div className="sa-mcard-sub">Next due {fmtDate(last?.nextPaymentDate)} {"\u00b7"} <span className="sa-mono">{money(totalOverdueAmountFor(data, s))}</span> due {"\u00b7"} {sessionsOverdue} sessions overdue</div>
+                    </div>
+                    <Pill tone={status === "Overdue" ? "red" : "amber"}>{status}</Pill>
+                  </div>
+                </div>
+              ))}
+            </div>
           ) : (
             <div className="sa-table-wrap">
               <table className="sa-table sa-table-compact">
@@ -3088,6 +3322,21 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
         {showPaid && (
           paidStudents.length === 0 ? (
             <p className="sa-muted-text">No paid players at this location yet.</p>
+          ) : isPhone ? (
+            <div className="sa-mcard-list sa-mcard-list-bordered sa-mcard-scroll">
+              {paidStudents.map(({ s, last }) => (
+                <div key={s.id} className="sa-mcard">
+                  <div className="sa-mcard-row">
+                    <div className="sa-mcard-main">
+                      <div className="sa-mcard-name">{s.name}{s.status === "Inactive" && <Pill tone="red"> Inactive</Pill>}</div>
+                      <div className="sa-mcard-sub">{s.jerseyName || "\u2014"} {"\u00b7"} #{s.jerseyNo} {"\u00b7"} {batchName(data, s.batchId)}</div>
+                      <div className="sa-mcard-sub"><span className="sa-mono">{money(last?.amount)}</span> {"\u00b7"} {last?.receiptNo} {"\u00b7"} Next due {fmtDate(last?.nextPaymentDate)}</div>
+                    </div>
+                    <button className="sa-btn sa-btn-ghost sa-btn-sm sa-touch-h" onClick={() => setEditingPayment({ student: s, payment: last })}><Pencil size={14} /> Update</button>
+                  </div>
+                </div>
+              ))}
+            </div>
           ) : (
             <div className="sa-table-wrap">
               <table className="sa-table sa-table-compact">
@@ -3152,6 +3401,141 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
   );
 }
 
+/* ============================== COACH ATTENDANCE ============================== */
+// Which coaches were present at a location on a given day, and how many sessions each took (1-3).
+// One row per coach + location + date in coach_attendance; choosing "—" removes that row.
+// Past dates can be marked; future dates can't.
+
+const COACH_SESSION_OPTIONS = [1, 2, 3];
+
+function CoachAttendancePage({ data, refetchCoachAttendance, locationId }) {
+  const today = todayISO();
+  const [date, setDate] = useState(today);
+  const [saveError, setSaveError] = useState(null);
+  const [pending, setPending] = useState({}); // coachId -> sessions (0 = clearing) while a save is in flight
+  const isPhone = useIsPhone();
+
+  if (!locationId || locationId === "ALL") {
+    return <EmptyState icon={UserCheck} title="Select a location" message="Choose a location from the top bar to mark coach attendance." />;
+  }
+
+  const records = data.coachAttendance.filter((r) => r.locationId === locationId && r.date === date);
+  const recordByCoach = new Map(records.map((r) => [r.coachId, r]));
+  // Coaches linked to this location, plus anyone already marked here that day (e.g. since unlinked).
+  const coaches = data.coaches
+    .filter((c) => c.locationIds.includes(locationId) || recordByCoach.has(c.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const sessionsFor = (coachId) =>
+    Object.prototype.hasOwnProperty.call(pending, coachId) ? pending[coachId] : (recordByCoach.get(coachId)?.sessions || 0);
+
+  const marked = coaches.filter((c) => sessionsFor(c.id) > 0);
+  const totalSessions = marked.reduce((sum, c) => sum + sessionsFor(c.id), 0);
+
+  const setSessions = async (coach, value) => {
+    const sessions = Number(value) || 0;
+    setPending((p) => ({ ...p, [coach.id]: sessions }));
+    const { error } = sessions > 0
+      ? await supabase.from("coach_attendance").upsert(
+          { coach_id: coach.id, location_id: locationId, date, sessions_count: sessions },
+          { onConflict: "coach_id,location_id,date" }
+        )
+      : await supabase.from("coach_attendance").delete().eq("coach_id", coach.id).eq("location_id", locationId).eq("date", date);
+    if (error) setSaveError(error.message);
+    else setSaveError(null);
+    await refetchCoachAttendance();
+    setPending((p) => {
+      if (p[coach.id] !== sessions) return p;
+      const next = { ...p };
+      delete next[coach.id];
+      return next;
+    });
+  };
+
+  const sessionSelect = (c) => (
+    <select
+      className="sa-inline-select sa-coach-sessions"
+      value={sessionsFor(c.id) || ""}
+      onChange={(e) => setSessions(c, e.target.value)}
+      aria-label={`Sessions for ${c.name}`}
+      disabled={data.coachAttendanceMissing}
+    >
+      <option value="">{"—"} Not present</option>
+      {COACH_SESSION_OPTIONS.map((n) => <option key={n} value={n}>{n} session{n > 1 ? "s" : ""}</option>)}
+    </select>
+  );
+
+  return (
+    <div className="sa-page">
+      {data.coachAttendanceMissing && (
+        <div className="sa-storage-warning"><AlertCircle size={14} /> Coach attendance isn't set up in the database yet. Run supabase/migrations_manual/create_coach_attendance.sql in the Supabase SQL Editor, then reload.</div>
+      )}
+      {saveError && <div className="sa-storage-warning"><AlertCircle size={14} /> {saveError}</div>}
+
+      <div className="sa-page-actions">
+        <div className="sa-search-row">
+          <DateInput
+            className="sa-inline-select sa-att-date"
+            value={date}
+            max={today}
+            onChange={(e) => { const v = e.target.value; if (v && v <= today) { setDate(v); setPending({}); } }}
+          />
+          {date !== today && <button className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => { setDate(today); setPending({}); }}>Today</button>}
+        </div>
+      </div>
+
+      <div className="sa-card">
+        <div className="sa-card-header">
+          <h3>Updated for {fmtDate(date)}</h3>
+          <span className="sa-muted-text">{marked.length} coach{marked.length === 1 ? "" : "es"} {"·"} {totalSessions} session{totalSessions === 1 ? "" : "s"}</span>
+        </div>
+        {marked.length === 0 ? (
+          <p className="sa-muted-text">No coaches marked for this day yet.</p>
+        ) : (
+          <div className="sa-coach-summary">
+            {marked.map((c) => (
+              <div key={c.id} className="sa-coach-chip">
+                <span>{c.name}</span>
+                <strong className="sa-mono">{sessionsFor(c.id)}</strong>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {coaches.length === 0 ? (
+        <EmptyState icon={Users} title="No coaches at this location" message="Link coaches to this location on the Coaches page." />
+      ) : isPhone ? (
+        <div className="sa-mcard-list sa-mcard-list-bordered">
+          {coaches.map((c) => (
+            <div key={c.id} className="sa-mcard">
+              <div className="sa-mcard-row">
+                <div className="sa-mcard-main">
+                  <div className="sa-mcard-name">{c.name}</div>
+                </div>
+                {sessionSelect(c)}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="sa-table-wrap">
+          <table className="sa-table sa-table-compact">
+            <thead><tr><th>Coach</th><th>No. of Sessions</th></tr></thead>
+            <tbody>
+              {coaches.map((c) => (
+                <tr key={c.id}>
+                  <td className="sa-td-strong">{c.name}</td>
+                  <td>{sessionSelect(c)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================== REPORTS ============================== */
 
 const REPORT_TABS = [
@@ -3159,6 +3543,7 @@ const REPORT_TABS = [
   { id: "attendance", label: "Attendance by Location" },
   { id: "feeList", label: "Fee List (Month)" },
   { id: "pendingFee", label: "Pending Fees" },
+  { id: "coachSessions", label: "Coach Sessions (Month)" },
 ];
 
 function ReportStudentSummary({ data }) {
@@ -3563,6 +3948,105 @@ function ReportPendingFee({ data }) {
   );
 }
 
+// Monthly total of sessions per coach per location, from Coach Attendance (Super Admin only — the
+// Reports page isn't available to location admins). Each coach also gets a total across locations.
+function ReportCoachSessions({ data }) {
+  const [month, setMonth] = useState(monthKey(todayISO()));
+  const [locationId, setLocationId] = useState("ALL");
+  const [coachId, setCoachId] = useState("ALL");
+
+  const totals = new Map(); // "coachId|locationId" -> { coachId, locationId, sessions, days }
+  for (const r of data.coachAttendance) {
+    if (monthKey(r.date) !== month) continue;
+    if (locationId !== "ALL" && r.locationId !== locationId) continue;
+    if (coachId !== "ALL" && r.coachId !== coachId) continue;
+    const key = `${r.coachId}|${r.locationId}`;
+    const t = totals.get(key) || { coachId: r.coachId, locationId: r.locationId, sessions: 0, days: 0 };
+    t.sessions += r.sessions;
+    t.days += 1;
+    totals.set(key, t);
+  }
+  const coachLabel = (id) => data.coaches.find((c) => c.id === id)?.name || "Unknown coach";
+  const rows = [...totals.values()].sort((a, b) =>
+    coachLabel(a.coachId).localeCompare(coachLabel(b.coachId)) || locationName(data, a.locationId).localeCompare(locationName(data, b.locationId)));
+  // Group rows by coach so each coach gets a total line.
+  const groups = [];
+  for (const r of rows) {
+    const last = groups[groups.length - 1];
+    if (last && last.coachId === r.coachId) last.rows.push(r);
+    else groups.push({ coachId: r.coachId, rows: [r] });
+  }
+  const grandTotal = rows.reduce((sum, r) => sum + r.sessions, 0);
+  const monthLabel = fmtMonth(`${month}-01`);
+
+  const exportExcel = () => {
+    const headers = ["Coach Name", "Location", "Month", "Days Present", "No. of Sessions"];
+    const out = [];
+    for (const g of groups) {
+      g.rows.forEach((r) => out.push([coachLabel(r.coachId), locationName(data, r.locationId), monthLabel, r.days, r.sessions]));
+      out.push([`${coachLabel(g.coachId)} total`, "", monthLabel, g.rows.reduce((s, r) => s + r.days, 0), g.rows.reduce((s, r) => s + r.sessions, 0)]);
+    }
+    out.push(["Grand total", "", monthLabel, rows.reduce((s, r) => s + r.days, 0), grandTotal]);
+    downloadXLSX(`coach-sessions-${month}.xlsx`, headers, out);
+  };
+
+  return (
+    <div>
+      <div className="sa-report-filters">
+        <Field label="Month"><input type="month" value={month} max={monthKey(todayISO())} onChange={(e) => e.target.value && setMonth(e.target.value)} /></Field>
+        <Field label="Location">
+          <select value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+            <option value="ALL">All Locations</option>
+            {data.locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Coach">
+          <select value={coachId} onChange={(e) => setCoachId(e.target.value)}>
+            <option value="ALL">All Coaches</option>
+            {[...data.coaches].sort((a, b) => a.name.localeCompare(b.name)).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </Field>
+        <button className="sa-btn sa-btn-primary sa-btn-sm" onClick={exportExcel} disabled={rows.length === 0}><Download size={14} /> Export to Excel</button>
+      </div>
+      {data.coachAttendanceMissing && <p className="sa-muted-text">Coach attendance isn't set up in the database yet.</p>}
+      {rows.length === 0 ? (
+        <p className="sa-muted-text">No coach sessions recorded for {monthLabel}.</p>
+      ) : (
+        <div className="sa-table-wrap">
+          <table className="sa-table sa-table-compact">
+            <thead><tr><th>Coach Name</th><th>Location</th><th>Month</th><th>Days Present</th><th>No. of Sessions</th></tr></thead>
+            <tbody>
+              {groups.map((g) => (
+                <React.Fragment key={g.coachId}>
+                  {g.rows.map((r) => (
+                    <tr key={`${r.coachId}|${r.locationId}`}>
+                      <td className="sa-td-strong">{coachLabel(r.coachId)}</td>
+                      <td>{locationName(data, r.locationId)}</td>
+                      <td>{monthLabel}</td>
+                      <td className="sa-mono">{r.days}</td>
+                      <td className="sa-mono">{r.sessions}</td>
+                    </tr>
+                  ))}
+                  <tr className="sa-row-subtotal">
+                    <td colSpan={3}>{coachLabel(g.coachId)} total</td>
+                    <td className="sa-mono">{g.rows.reduce((s, r) => s + r.days, 0)}</td>
+                    <td className="sa-mono">{g.rows.reduce((s, r) => s + r.sessions, 0)}</td>
+                  </tr>
+                </React.Fragment>
+              ))}
+              <tr className="sa-row-total">
+                <td colSpan={3}>Grand total</td>
+                <td className="sa-mono">{rows.reduce((s, r) => s + r.days, 0)}</td>
+                <td className="sa-mono">{grandTotal}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ReportsPage({ data }) {
   const [tab, setTab] = useState("studentSummary");
   return (
@@ -3579,6 +4063,7 @@ function ReportsPage({ data }) {
         {tab === "attendance" && <ReportAttendance data={data} />}
         {tab === "feeList" && <ReportFeeList data={data} />}
         {tab === "pendingFee" && <ReportPendingFee data={data} />}
+        {tab === "coachSessions" && <ReportCoachSessions data={data} />}
       </div>
     </div>
   );
@@ -3973,6 +4458,17 @@ export default function App() {
     }
   }, [refetchData]);
 
+  // Lighter refresh for Coach Attendance saves: only that table changes there.
+  const refetchCoachAttendance = useCallback(async () => {
+    try {
+      const res = await loadCoachAttendance();
+      setData((prev) => (prev ? { ...prev, coachAttendance: res.rows, coachAttendanceMissing: res.missing } : prev));
+      setDataError(null);
+    } catch {
+      await refetchData();
+    }
+  }, [refetchData]);
+
   useEffect(() => {
     // Number inputs change value on scroll when focused, which is easy to trigger by
     // accident while scrolling the page — blur before the browser applies the scroll delta.
@@ -4045,9 +4541,18 @@ export default function App() {
   }, [adminProfile, refetchData]);
 
   const currentRole = adminProfile?.role || "location_admin";
-  // A location_admin only gets Players, Attendance and Fee Update; anything else
+  // A location_admin only gets Players, Attendance, Fee Update and Coach Attendance; anything else
   // (including the initial "dashboard" view) falls back to their default page.
-  const activeView = canAccessView(currentRole, view) ? view : defaultViewFor(currentRole);
+  // On a phone, pages outside PHONE_VIEWS aren't opened either (e.g. a tablet rotated to phone size).
+  const isPhone = useIsPhone();
+  const viewAllowed = canAccessView(currentRole, view) && (!isPhone || PHONE_VIEWS.has(view));
+  const activeView = viewAllowed ? view : defaultViewFor(currentRole);
+  const [toast, setToast] = useState(null);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3500);
+    return () => clearTimeout(t);
+  }, [toast]);
   useEffect(() => {
     if (adminProfile && view !== activeView) setView(activeView);
   }, [adminProfile, view, activeView]);
@@ -4127,6 +4632,8 @@ export default function App() {
         view={activeView} setView={setView} collapsed={collapsed} setCollapsed={setCollapsed}
         currentRole={currentRole} adminName={adminProfile.name} onSignOut={handleSignOut}
         mobileOpen={mobileNavOpen} onCloseMobile={() => setMobileNavOpen(false)}
+        isPhone={isPhone}
+        onUnavailable={(label) => setToast(`${label} isn't available on mobile. Please use a laptop or desktop.`)}
       />
       <div className="sa-main">
         <Topbar
@@ -4146,10 +4653,12 @@ export default function App() {
           {activeView === "coaches" && <CoachesPage data={data} refetchData={refetchData} locationId={locationId} />}
           {activeView === "schedules" && <SchedulesPage data={data} refetchData={refetchData} locationId={locationId} />}
           {activeView === "feeUpdate" && <FeeUpdatePage data={data} refetchData={refetchData} refetchPayments={refetchPayments} locationId={locationId} />}
+          {activeView === "coachAttendance" && <CoachAttendancePage data={data} refetchCoachAttendance={refetchCoachAttendance} locationId={locationId} />}
           {activeView === "reports" && <ReportsPage data={data} />}
           {activeView === "manageAdmins" && <ManageAdminsPage currentRole={currentRole} />}
         </div>
       </div>
+      {toast && <div className="sa-toast" role="status">{toast}</div>}
     </div>
   );
 }
@@ -4211,6 +4720,16 @@ const STYLES = `
 }
 .sa-nav-item:hover { background: var(--navy-light); color: #fff; }
 .sa-nav-item-active { background: var(--navy-lighter); color: #fff; }
+/* Phone menu: pages that only work on a laptop, listed greyed out under a label. */
+.sa-nav-group-label { margin: 14px 12px 4px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 10.5px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: #6E7F99; }
+.sa-nav-item.sa-nav-item-disabled { color: #5D6D85; }
+.sa-nav-item.sa-nav-item-disabled:hover { background: transparent; color: #5D6D85; }
+/* Short message shown at the bottom of the screen (e.g. "isn't available on mobile"). */
+.sa-toast {
+  position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  z-index: 200; max-width: calc(100vw - 32px); width: max-content; background: var(--navy); color: #fff;
+  padding: 12px 16px; border-radius: 10px; font-size: 13.5px; line-height: 1.4; box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+}
 .sa-nav-indicator { position: absolute; left: -12px; top: 8px; bottom: 8px; width: 3px; background: var(--amber); border-radius: 0 3px 3px 0; }
 .sa-sidebar-footer { padding: 14px 18px 20px; font-size: 10.5px; color: #62759A; }
 .sa-sidebar-footer-line { height: 1px; background: var(--navy-light); margin-bottom: 10px; }
@@ -4509,6 +5028,35 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
 .sa-list-scroll thead th { position: sticky; top: 0; z-index: 1; }
 .sa-list-count { font-size: 12px; color: var(--muted); margin-bottom: -6px; }
 
+/* Phone card lists (Players, Attendance, Fee Update) — only rendered below 700px. */
+.sa-mcard-list { display: flex; flex-direction: column; background: var(--card); }
+.sa-mcard-list-bordered { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.sa-mcard { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.sa-mcard:last-child { border-bottom: none; }
+.sa-mcard-row { display: flex; align-items: center; gap: 10px; }
+.sa-mcard-main { flex: 1; min-width: 0; }
+.sa-mcard-name { font-size: 14px; font-weight: 600; color: var(--ink); line-height: 1.35; overflow-wrap: anywhere; }
+.sa-mcard-muted { font-weight: 500; color: var(--muted); }
+.sa-mcard-sub { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin-top: 2px; overflow-wrap: anywhere; }
+.sa-mcard-sub .sa-pill { margin-left: 0; margin-right: 4px; }
+.sa-mcard .sa-pill { flex-shrink: 0; }
+.sa-mcard-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.sa-mcard-actions-end { justify-content: flex-end; margin: -4px -8px -8px 0; }
+.sa-touch-btn { width: 44px; height: 44px; text-decoration: none; }
+.sa-mcard-scroll { max-height: 60vh; max-height: 60dvh; overflow-y: auto; }
+.sa-touch-h { min-height: 44px; flex-shrink: 0; }
+.sa-tel-link { color: var(--navy); text-decoration: underline; }
+.sa-att-toggle-lg { flex-shrink: 0; }
+.sa-att-toggle-lg .sa-att-toggle-btn { width: 52px; height: 44px; padding: 0; }
+
+/* ---------- Coach Attendance ---------- */
+.sa-coach-summary { display: flex; flex-wrap: wrap; gap: 8px; }
+.sa-coach-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+.sa-coach-chip strong { background: var(--navy); color: var(--amber); border-radius: 6px; padding: 1px 7px; font-size: 12px; }
+.sa-coach-sessions { min-width: 150px; padding: 6px 8px; font-size: 13px; }
+.sa-row-subtotal td { background: var(--bg); font-weight: 700; }
+.sa-row-total td { background: var(--navy); color: #fff; font-weight: 700; }
+
 /* ---------- Fee Update ---------- */
 .sa-search-results { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
 .sa-search-result-row { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 8px; cursor: pointer; }
@@ -4560,5 +5108,52 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
   .sa-attendance-table th:nth-child(6), .sa-attendance-table td:nth-child(6) { width: 29%; }
   .sa-attendance-table .sa-att-toggle-btn { padding: 5px 8px; }
   .sa-attendance-table .sa-pill { padding: 2px 5px; font-size: 9px; margin-left: 0; }
+}
+
+/* Phones (upright or sideways): fit the screen, no zoom-on-tap, room for notches and home bars.
+   Same condition as PHONE_QUERY. */
+@media (max-width: 700px), (max-height: 500px) and (pointer: coarse) {
+  .sa-root { min-height: 100dvh; }
+  /* iOS zooms into any text field under 16px on focus, which lets the page slide sideways. */
+  .sa-root input, .sa-root select, .sa-root textarea { font-size: 16px; }
+  .sa-topbar { padding: calc(10px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) 10px calc(14px + env(safe-area-inset-left)); gap: 10px; }
+  .sa-topbar-left { min-width: 0; gap: 8px; }
+  .sa-topbar-left > div { min-width: 0; }
+  .sa-topbar-eyebrow { font-size: 10px; letter-spacing: 0.6px; margin-bottom: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sa-topbar-title { font-size: 17px; }
+  .sa-location-select { flex-shrink: 0; max-width: 46%; }
+  .sa-location-select select { max-width: 100%; text-overflow: ellipsis; }
+  .sa-content { padding: 12px calc(12px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); }
+  .sa-sidebar { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-left: env(safe-area-inset-left); }
+  .sa-page { gap: 10px; }
+  .sa-search-box { min-width: 0 !important; width: 100%; }
+  .sa-scoreboard.sa-scoreboard-compact { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+  .sa-scoreboard-compact .sa-scorecard { padding: 8px 12px; }
+  .sa-scoreboard.sa-scoreboard-compact > .sa-scorecard:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .sa-scoreboard-compact .sa-scorecard::after { display: none; }
+  .sa-scoreboard-compact .sa-scorecard-top { margin-bottom: 2px; }
+  .sa-scoreboard-compact .sa-scorecard-label { font-size: 10px; letter-spacing: 0.8px; }
+  .sa-scoreboard-compact .sa-scorecard-value { font-size: 18px; }
+  .sa-scoreboard-compact .sa-scorecard-sub { margin-top: 2px; font-size: 10.5px; }
+  .sa-card { padding: 14px; }
+  /* Attendance filters: search on its own line, then batch / status / attendance / date in even
+     columns — one row when the screen is wide enough (phone sideways), otherwise two rows of two. */
+  .sa-att-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+  .sa-att-filters .sa-search-box { grid-column: 1 / -1; }
+  .sa-att-filters > select, .sa-att-filters > .sa-date-input { width: 100%; min-width: 0; height: 40px; }
+  .sa-att-filters > .sa-date-input { display: flex; align-items: center; }
+  /* Compact player summary (Fee Update and the player record): small tiles, three across. */
+  .sa-student-detail-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 10px !important; }
+  .sa-student-detail-grid div { padding: 6px 8px; gap: 1px; }
+  .sa-student-detail-grid span { font-size: 9.5px; letter-spacing: 0.3px; }
+  .sa-student-detail-grid strong { font-size: 12.5px; overflow-wrap: anywhere; }
+  /* Coach Attendance */
+  .sa-coach-sessions { min-width: 0; width: 150px; height: 44px; flex-shrink: 0; }
+  .sa-coach-chip { font-size: 13px; }
+  /* Dashboard */
+  .sa-dash-phone-filter { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  .sa-dash-phone-filter select { flex: 1; min-width: 0; height: 40px; }
+  .sa-dash-grid .sa-card-header { flex-wrap: wrap; gap: 8px; }
+  .sa-dash-grid .sa-card-header h3 { font-size: 14px; }
 }
 `;
