@@ -3,7 +3,8 @@ import {
   LayoutDashboard, MapPin, Wallet, Layers, Users, Calendar as CalendarIcon,
   Receipt, FileBarChart, Plus, Pencil, Trash2, X, Search, ChevronLeft,
   ChevronRight, Download, Check, AlertCircle, Clock, TrendingUp,
-  UserRound, Phone, Mail, Menu, ClipboardList, MessageSquare, ShieldCheck, ShieldOff, UserX, UserCheck
+  UserRound, Phone, Menu, ClipboardList, MessageSquare, ShieldCheck, ShieldOff, UserX, UserCheck,
+  Settings as SettingsIcon
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -20,7 +21,7 @@ const CURRENCY = "AED";
 // Earliest month selectable in the Dashboard's "Revenue & Attendance by Location"
 // month picker — the academy's data starts here, so the rolling "past 12 months"
 // window never reaches back further than this even once 12 months have elapsed.
-const DASHBOARD_TREND_MIN_MONTH = "2026-08";
+const DASHBOARD_TREND_MIN_MONTH = "2026-08"; // fallback when Settings has no Dashboard start month or term start
 const DURATIONS = ["Fixed Sessions", "Monthly", "Quarterly", "4 Months", "Full Term"];
 const GENDERS = ["Any", "Male", "Female"];
 const NAV_ITEMS = [
@@ -36,6 +37,7 @@ const NAV_ITEMS = [
   { id: "feeUpdate", label: "Fee Update", icon: Receipt },
   { id: "reports", label: "Reports", icon: FileBarChart },
   { id: "manageAdmins", label: "Manage Admins", icon: ShieldCheck, superAdminOnly: true },
+  { id: "settings", label: "Settings", icon: SettingsIcon, superAdminOnly: true },
 ];
 const LOCATION_SCOPED = new Set(["paymentPlans", "batches", "students", "attendance", "coaches", "schedules", "feeUpdate", "coachAttendance"]);
 // Pages a location_admin may open. super_admin can open everything.
@@ -195,12 +197,13 @@ function downloadXLSX(filename, headers, rows) {
 // have no "id") so repeated pages see a consistent row order and nothing is
 // skipped or duplicated.
 const SUPABASE_PAGE_SIZE = 1000;
-async function fetchAllRows(table, { orderBy = ["id"] } = {}) {
+async function fetchAllRows(table, { orderBy = ["id"], filters = [] } = {}) {
   const orderCols = Array.isArray(orderBy) ? orderBy : [orderBy];
   let rows = [];
   let from = 0;
   for (;;) {
     let q = supabase.from(table).select("*");
+    filters.forEach(([col, value]) => { q = q.eq(col, value); });
     orderCols.forEach((col) => { q = q.order(col, { ascending: true }); });
     q = q.range(from, from + SUPABASE_PAGE_SIZE - 1);
     const { data, error } = await q;
@@ -215,7 +218,7 @@ async function fetchAllRows(table, { orderBy = ["id"] } = {}) {
 async function loadAllData() {
   const [
     locationsRes, paymentPlansRes, batchesRes, coachesRes, coachLocationsRes,
-    studentsRes, sessionsRes, sessionCoachesRes, attendanceRes, paymentsRes, coachAttendanceRes,
+    studentsRes, sessionsRes, sessionCoachesRes, attendanceRes, paymentsRes, coachAttendanceRes, settingsRes,
   ] = await Promise.all([
     fetchAllRows("locations", { orderBy: ["name", "id"] }),
     fetchAllRows("payment_plans"),
@@ -228,6 +231,7 @@ async function loadAllData() {
     fetchAllRows("attendance"),
     fetchAllRows("payments"),
     loadCoachAttendance(),
+    loadAppSettings(),
   ]);
 
   const firstError = [
@@ -236,17 +240,9 @@ async function loadAllData() {
   ].find((r) => r.error)?.error;
   if (firstError) throw firstError;
 
-  const locations = (locationsRes.data || []).map((l) => ({
-    id: l.id, name: l.name, address: l.address, contact: l.contact,
-    admin: l.admin_name || "", adminUserId: l.admin_user_id || "",
-  }));
-  const paymentPlans = (paymentPlansRes.data || []).map((p) => ({
-    id: p.id, locationId: p.location_id, name: p.name, gender: p.gender,
-    duration: p.duration, sessionsCount: p.sessions_count ?? "", amount: p.amount,
-  }));
-  const batches = (batchesRes.data || []).map((b) => ({
-    id: b.id, locationId: b.location_id, batchCode: b.batch_code || "", name: b.name,
-  }));
+  const locations = (locationsRes.data || []).map(mapLocationRow);
+  const paymentPlans = (paymentPlansRes.data || []).map(mapPaymentPlanRow);
+  const batches = (batchesRes.data || []).map(mapBatchRow);
 
   const coachLocMap = {};
   (coachLocationsRes.data || []).forEach((cl) => {
@@ -257,35 +253,54 @@ async function loadAllData() {
     specialty: c.specialty || "", locationIds: coachLocMap[c.id] || [],
   }));
 
-  const students = (studentsRes.data || []).map((s) => ({
-    id: s.id, name: s.name, phone: s.phone || "", email: s.email || "", dob: s.dob || "",
-    dateOfJoining: s.date_of_joining || "",
-    batchId: s.batch_id || "", locationId: s.location_id, jerseyName: s.jersey_name || "",
-    jerseyNo: s.jersey_no || "", sessionsPerWeek: s.sessions_per_week ?? 2,
-    attendanceDays: s.attendance_days || [],
-    paymentPlanId: s.payment_plan_id || "", overrideFee: s.override_fee ?? "",
-    status: s.status, remark: s.remark || "",
-  }));
+  const students = (studentsRes.data || []).map(mapStudentRow);
 
   const sessCoachMap = {};
   (sessionCoachesRes.data || []).forEach((sc) => {
     (sessCoachMap[sc.session_id] ||= []).push(sc.coach_id);
   });
-  const sessions = (sessionsRes.data || []).map((s) => ({
-    id: s.id, locationId: s.location_id, batchId: s.batch_id, date: s.date,
-    startTime: (s.start_time || "00:00").slice(0, 5), endTime: (s.end_time || "00:00").slice(0, 5),
-    coachIds: sessCoachMap[s.id] || [],
-  }));
+  const sessions = (sessionsRes.data || []).map((s) => mapSessionRow(s, sessCoachMap[s.id] || []));
 
-  const attendance = (attendanceRes.data || []).map((a) => ({
-    id: a.id, sessionId: a.session_id, studentId: a.student_id, status: a.status,
-  }));
+  const attendance = (attendanceRes.data || []).map(mapAttendanceRow);
   const payments = (paymentsRes.data || []).map(mapPaymentRow);
 
   return {
     locations, paymentPlans, batches, coaches, students, sessions, attendance, payments,
     coachAttendance: coachAttendanceRes.rows, coachAttendanceMissing: coachAttendanceRes.missing,
+    settings: settingsRes.settings, settingsMissing: settingsRes.missing,
   };
+}
+
+// App-wide settings (Settings page, Super Admin only to change). One row in app_settings, created by
+// supabase/migrations_manual/create_app_settings.sql. Until that's run, defaults apply and the app
+// loads normally.
+const DEFAULT_SETTINGS = { feeHistoryFrom: "", termStart: "", termEnd: "", dashboardStartMonth: "", updatedAt: "" };
+async function loadAppSettings() {
+  const { data: rows, error } = await supabase.from("app_settings").select("*").eq("id", 1);
+  if (error) {
+    const msg = `${error.code || ""} ${error.message || ""}`;
+    if (/42P01|PGRST205|app_settings/i.test(msg)) return { settings: DEFAULT_SETTINGS, missing: true };
+    throw error;
+  }
+  const r = (rows || [])[0];
+  if (!r) return { settings: DEFAULT_SETTINGS, missing: false };
+  return {
+    settings: {
+      feeHistoryFrom: r.fee_history_from || "",
+      termStart: r.term_start || "",
+      termEnd: r.term_end || "",
+      dashboardStartMonth: r.dashboard_start_month ? String(r.dashboard_start_month).slice(0, 7) : "",
+      updatedAt: r.updated_at || "",
+    },
+    missing: false,
+  };
+}
+// Earliest month the Dashboard month picker offers: the Settings value, else the term start's month,
+// else the built-in fallback.
+function dashboardStartMonth(settings) {
+  if (settings?.dashboardStartMonth) return settings.dashboardStartMonth;
+  if (settings?.termStart) return monthKey(settings.termStart);
+  return DASHBOARD_TREND_MIN_MONTH;
 }
 
 // coach_attendance is created by supabase/migrations_manual/create_coach_attendance.sql. Until that
@@ -322,6 +337,86 @@ async function loadPayments() {
   const res = await fetchAllRows("payments");
   if (res.error) throw res.error;
   return (res.data || []).map(mapPaymentRow);
+}
+
+function mapLocationRow(l) {
+  return {
+    id: l.id, name: l.name, address: l.address, contact: l.contact,
+    admin: l.admin_name || "", adminUserId: l.admin_user_id || "",
+  };
+}
+function mapPaymentPlanRow(p) {
+  return {
+    id: p.id, locationId: p.location_id, name: p.name, gender: p.gender,
+    duration: p.duration, sessionsCount: p.sessions_count ?? "", amount: p.amount,
+  };
+}
+function mapBatchRow(b) {
+  return { id: b.id, locationId: b.location_id, batchCode: b.batch_code || "", name: b.name };
+}
+// Locations / Payment Plans / Batches add or edit: reload only that table, with the same order
+// the full load uses.
+const SINGLE_TABLE_LOADS = {
+  locations: { table: "locations", orderBy: ["name", "id"], map: mapLocationRow },
+  paymentPlans: { table: "payment_plans", orderBy: ["id"], map: mapPaymentPlanRow },
+  batches: { table: "batches", orderBy: ["id"], map: mapBatchRow },
+};
+async function loadSingleTable(key) {
+  const { table, orderBy, map } = SINGLE_TABLE_LOADS[key];
+  const res = await fetchAllRows(table, { orderBy });
+  if (res.error) throw res.error;
+  return (res.data || []).map(map);
+}
+
+function mapStudentRow(s) {
+  return {
+    id: s.id, name: s.name, phone: s.phone || "", email: s.email || "", dob: s.dob || "",
+    dateOfJoining: s.date_of_joining || "",
+    batchId: s.batch_id || "", locationId: s.location_id, jerseyName: s.jersey_name || "",
+    jerseyNo: s.jersey_no || "", sessionsPerWeek: s.sessions_per_week ?? 2,
+    attendanceDays: s.attendance_days || [],
+    paymentPlanId: s.payment_plan_id || "", overrideFee: s.override_fee ?? "",
+    status: s.status, remark: s.remark || "",
+  };
+}
+function mapSessionRow(s, coachIds) {
+  return {
+    id: s.id, locationId: s.location_id, batchId: s.batch_id, date: s.date,
+    startTime: (s.start_time || "00:00").slice(0, 5), endTime: (s.end_time || "00:00").slice(0, 5),
+    coachIds,
+  };
+}
+function mapAttendanceRow(a) {
+  return { id: a.id, sessionId: a.session_id, studentId: a.student_id, status: a.status };
+}
+
+// Targeted reloads after a save (instead of reloading every table):
+// players only — same order as the full load (name, then id).
+async function loadStudents() {
+  const res = await fetchAllRows("students", { orderBy: ["name", "id"] });
+  if (res.error) throw res.error;
+  return (res.data || []).map(mapStudentRow);
+}
+// One player's payments, in the same order (by id) the full load uses.
+async function loadStudentPayments(studentId) {
+  const res = await fetchAllRows("payments", { filters: [["student_id", studentId]] });
+  if (res.error) throw res.error;
+  return (res.data || []).map(mapPaymentRow);
+}
+// Same ordering as the database's "order by id" (numbers numerically; uuids compare like their text).
+function compareIds(a, b) {
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  const x = String(a), y = String(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+// Put a row into a list kept in id order: replaces the row with the same id, or inserts it where
+// a full reload would place it.
+function upsertById(list, row) {
+  const i = list.findIndex((r) => r.id === row.id);
+  if (i >= 0) { const next = list.slice(); next[i] = row; return next; }
+  let lo = 0, hi = list.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (compareIds(list[mid].id, row.id) < 0) lo = mid + 1; else hi = mid; }
+  const next = list.slice(); next.splice(lo, 0, row); return next;
 }
 
 /* ============================== DOMAIN HELPERS ============================== */
@@ -376,6 +471,38 @@ function presentSessionsFor(data, studentId) {
 function studentPayments(data, studentId) {
   return (paymentsByStudent(data).get(studentId) || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
 }
+// Fee History order (Fee Update and the player record): newest period first — by start date, then end date (descending).
+// Payments without a period (Extra Jersey / Full Kit) are placed by their payment date.
+function feeHistoryPayments(data, studentId) {
+  const periodStart = (p) => p.startDate || p.date || "";
+  const periodEnd = (p) => p.endDate || p.startDate || p.date || "";
+  return (paymentsByStudent(data).get(studentId) || []).slice().sort((a, b) =>
+    periodStart(b).localeCompare(periodStart(a)) ||
+    periodEnd(b).localeCompare(periodEnd(a)) ||
+    (b.date || "").localeCompare(a.date || "")
+  );
+}
+// Which Fee History rows can be edited:
+// - Extra Jersey / Full Kit payments: always.
+// - Fee payments: the last payment received, i.e. every Fee payment recorded on the most recent
+//   payment date (a 3-month payment entered as 3 monthly records on the same day = all 3 editable).
+// Settings > "Fee History: show payments from" — rows paid before that date are hidden from Fee
+// History (display only: fee status, Pending/Paid lists, Dashboard and Reports still use every payment).
+function visibleFeeHistory(payments, settings) {
+  const from = settings?.feeHistoryFrom;
+  if (!from) return { shown: payments, hiddenCount: 0, from: "" };
+  const shown = payments.filter((p) => (p.date || "") >= from);
+  return { shown, hiddenCount: payments.length - shown.length, from };
+}
+function editablePaymentIds(payments) {
+  const fees = payments.filter((p) => (p.paymentType || "Fee") === "Fee");
+  const lastReceived = fees.reduce((max, p) => (p.date && p.date > max ? p.date : max), "");
+  return new Set(
+    payments
+      .filter((p) => (p.paymentType || "Fee") !== "Fee" || (lastReceived && p.date === lastReceived))
+      .map((p) => p.id)
+  );
+}
 // The payment that determines a student's CURRENT fee due status. Only "Fee" type
 // payments count — Extra Jersey / Full Kit payments never carry a next_payment_date and
 // must never be picked over (or shadow) an actual fee payment. Among a student's Fee
@@ -428,17 +555,37 @@ function coachNames(data, coachIds) {
   if (!coachIds || coachIds.length === 0) return "Unassigned";
   return coachIds.map((id) => coachName(data, id)).join(", ");
 }
+// Per student: month ("YYYY-MM") -> number of "Present" attendance rows whose session is in that
+// month. Built once per loaded data (cached like the other indexes above) instead of scanning every
+// session and every attendance row for each student and month. Same counts as before.
+const _presentByMonthIdx = new WeakMap();
+function presentCountsByMonth(data) {
+  const cached = _presentByMonthIdx.get(data.attendance);
+  if (cached && cached.sessions === data.sessions) return cached.idx;
+  const monthsBySession = new Map(); // session id -> set of months (a single month in practice)
+  for (const se of data.sessions) {
+    let months = monthsBySession.get(se.id);
+    if (!months) { months = new Set(); monthsBySession.set(se.id, months); }
+    months.add(monthKey(se.date));
+  }
+  const idx = new Map();
+  for (const a of data.attendance) {
+    if (a.status !== "P") continue;
+    const months = monthsBySession.get(a.sessionId);
+    if (!months) continue;
+    let byMonth = idx.get(a.studentId);
+    if (!byMonth) { byMonth = new Map(); idx.set(a.studentId, byMonth); }
+    for (const m of months) byMonth.set(m, (byMonth.get(m) || 0) + 1);
+  }
+  _presentByMonthIdx.set(data.attendance, { sessions: data.sessions, idx });
+  return idx;
+}
 function sessionsCountForStudentInMonth(data, studentId, mKey) {
-  const sessIds = new Set(
-    data.sessions.filter((s) => monthKey(s.date) === mKey).map((s) => s.id)
-  );
-  return data.attendance.filter(
-    (a) => a.studentId === studentId && a.status === "P" && sessIds.has(a.sessionId)
-  ).length;
+  return presentCountsByMonth(data).get(studentId)?.get(mKey) || 0;
 }
 function feePaidForStudentInMonth(data, studentId, mKey) {
-  return data.payments
-    .filter((p) => p.studentId === studentId && monthKey(p.date) === mKey)
+  return (paymentsByStudent(data).get(studentId) || [])
+    .filter((p) => monthKey(p.date) === mKey)
     .reduce((sum, p) => sum + Number(p.amount || 0), 0);
 }
 // Dashboard "Income" for a given month (mKey, "YYYY-MM"): sum of the Fee
@@ -559,6 +706,16 @@ function lastAttendedDate(data, studentId) {
     if (!latest || se.date > latest) latest = se.date;
   }
   return latest;
+}
+// Fee History "Sessions Attended": the player's "Present" sessions from startDate to endDate,
+// both days included. null when the payment has no period (Extra Jersey / Full Kit).
+function attendedSessionsBetween(data, studentId, startDate, endDate) {
+  if (!startDate || !endDate) return null;
+  let count = 0;
+  for (const se of presentSessionsFor(data, studentId).values()) {
+    if (se.date >= startDate && se.date <= endDate) count += 1;
+  }
+  return count;
 }
 // True if the student has at least one "Present" record on a session dated after cutoffDate.
 function hasAttendedAfter(data, studentId, cutoffDate) {
@@ -697,12 +854,12 @@ function SearchClearButton({ onClear }) {
   );
 }
 
-function DateInput({ value, onChange, className = "", min, max }) {
+function DateInput({ value, onChange, className = "", min, max, placeholder = "" }) {
   const inputRef = useRef(null);
   return (
     <div className={`sa-date-input ${className}`} onClick={() => inputRef.current?.showPicker?.()}>
       <input ref={inputRef} type="date" value={value} onChange={onChange} min={min} max={max} />
-      <span className="sa-date-display">{value ? fmtDate(value) : ""}</span>
+      <span className="sa-date-display">{value ? fmtDate(value) : placeholder}</span>
     </div>
   );
 }
@@ -757,20 +914,22 @@ function telHref(phone) {
   const digits = String(phone || "").replace(/[^\d+]/g, "");
   return digits ? `tel:${digits}` : null;
 }
-function CallButton({ phone, name }) {
-  const href = telHref(phone);
-  if (!href) return null;
-  return (
-    <a className="sa-icon-btn sa-touch-btn" href={href} onClick={(e) => e.stopPropagation()} aria-label={`Call ${name}`} title={`Call ${phone}`}>
-      <Phone size={17} />
-    </a>
-  );
-}
 // Fee history as stacked cards (phones): amount · mode · payment date, then the period covered, then the next due date.
 // renderActions(payment, index) adds optional buttons.
+// Small line under "Fee History" when Settings hides older payments.
+function FeeHistoryFromNote({ view }) {
+  if (!view.from) return null;
+  return (
+    <p className="sa-history-from-note">
+      Showing payments from {fmtDate(view.from)}
+      {view.hiddenCount > 0 && <> {"\u00b7"} {view.hiddenCount} older payment{view.hiddenCount === 1 ? "" : "s"} hidden</>}
+    </p>
+  );
+}
+
 // Phones show only the most recent few payments (payments arrive newest first); laptops show the full table.
 const PHONE_PAYMENT_LIMIT = 4;
-function PaymentCards({ payments, renderActions }) {
+function PaymentCards({ payments, renderActions, attendedFor }) {
   return (
     <div className="sa-mcard-list sa-mcard-list-bordered">
       {payments.slice(0, PHONE_PAYMENT_LIMIT).map((p, i) => (
@@ -779,7 +938,10 @@ function PaymentCards({ payments, renderActions }) {
             <div className="sa-mcard-main">
               <div className="sa-mcard-name"><span className="sa-mono">{money(p.amount)}</span><span className="sa-mcard-muted"> {"\u00b7"} {p.paymentMode || "\u2014"} {"\u00b7"} {fmtDate(p.date)}</span></div>
               {(p.startDate || p.endDate) && (
-                <div className="sa-mcard-sub">Covers {p.startDate ? fmtDate(p.startDate) : "\u2014"} to {p.endDate ? fmtDate(p.endDate) : "\u2014"}</div>
+                <div className="sa-mcard-sub">
+                  Covers {p.startDate ? fmtDate(p.startDate) : "\u2014"} to {p.endDate ? fmtDate(p.endDate) : "\u2014"}
+                  {attendedFor && attendedFor(p) != null && <> {"\u00b7"} {attendedFor(p)} session{attendedFor(p) === 1 ? "" : "s"} attended</>}
+                </div>
               )}
               {p.nextPaymentDate && <div className="sa-mcard-sub">Next due {fmtDate(p.nextPaymentDate)}</div>}
             </div>
@@ -939,12 +1101,15 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
 
   // Shared month picker for both dashboard charts below (Revenue & Attendance by Location, and
   // Revenue Split & Enrollment by Location) — one selection drives them both. Defaults to the
-  // current month, with a range covering the past 12 months (floored at DASHBOARD_TREND_MIN_MONTH
-  // so it never reaches earlier than the academy's data start).
+  // current month, with a range covering the past 12 months (floored at the Dashboard start month
+  // from Settings so it never reaches earlier than the academy's data / current term).
   const [trendMonthKey, setTrendMonthKey] = useState(currentMonthKey);
-  const trendMinMonthKey = monthKey(shiftMonths(todayISO(), -11)) > DASHBOARD_TREND_MIN_MONTH
+  // Floor comes from Settings (Dashboard start month, else term start month, else the fallback);
+  // never later than the current month.
+  const startMonthFloor = dashboardStartMonth(data.settings) > currentMonthKey ? currentMonthKey : dashboardStartMonth(data.settings);
+  const trendMinMonthKey = monthKey(shiftMonths(todayISO(), -11)) > startMonthFloor
     ? monthKey(shiftMonths(todayISO(), -11))
-    : DASHBOARD_TREND_MIN_MONTH;
+    : startMonthFloor;
 
   // Outstanding is always "as of today" (it's not a historical monthly figure the way Paid is),
   // so it's only folded into the chart when the picker is on the current month — for any other
@@ -1214,9 +1379,8 @@ function DashboardPage({ data, dashLocationId, setDashLocationId }) {
 
 /* ============================== LOCATIONS ============================== */
 
-function LocationsPage({ data, refetchData }) {
+function LocationsPage({ data, refetchData, refetchTable }) {
   const [modal, setModal] = useState(null); // { mode: 'add'|'edit', location }
-  const [confirmDelete, setConfirmDelete] = useState(null);
   const [saveError, setSaveError] = useState(null);
   const [form, setForm] = useState({ name: "", address: "", contact: "", admin: "", adminUserId: "" });
   const [saving, setSaving] = useState(false);
@@ -1239,7 +1403,7 @@ function LocationsPage({ data, refetchData }) {
         : await supabase.from("locations").update(payload).eq("id", modal.id);
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await refetchData();
+      await (refetchTable ? refetchTable("locations") : refetchData()); // only this table changed
       setModal(null);
     } finally {
       savingRef.current = false;
@@ -1247,13 +1411,6 @@ function LocationsPage({ data, refetchData }) {
     }
   };
 
-  const remove = async (id) => {
-    const { error } = await supabase.from("locations").delete().eq("id", id);
-    if (error) { setSaveError(friendlyDeleteError(error, "location")); setConfirmDelete(null); return; }
-    setSaveError(null);
-    await refetchData();
-    setConfirmDelete(null);
-  };
 
   return (
     <div className="sa-page">
@@ -1276,7 +1433,6 @@ function LocationsPage({ data, refetchData }) {
                   <div className="sa-loc-icon"><MapPin size={18} /></div>
                   <div className="sa-loc-card-actions">
                     <button className="sa-icon-btn" onClick={() => openEdit(loc)}><Pencil size={14} /></button>
-                    <button className="sa-icon-btn" onClick={() => setConfirmDelete(loc.id)}><Trash2 size={14} /></button>
                   </div>
                 </div>
                 <h3>{loc.name}</h3>
@@ -1321,22 +1477,14 @@ function LocationsPage({ data, refetchData }) {
         </Modal>
       )}
 
-      {confirmDelete && (
-        <ConfirmDialog
-          message="Delete this location? This also deletes its batches, schedules, payment plans, and any players with no attendance or payment history. If any player at this location has attendance or payment records, the location can't be deleted until those are resolved."
-          onCancel={() => setConfirmDelete(null)}
-          onConfirm={() => remove(confirmDelete)}
-        />
-      )}
     </div>
   );
 }
 
 /* ============================== PAYMENT PLANS ============================== */
 
-function PaymentPlansPage({ data, refetchData, locationId }) {
+function PaymentPlansPage({ data, refetchData, refetchTable, locationId }) {
   const [modal, setModal] = useState(null);
-  const [confirmDelete, setConfirmDelete] = useState(null);
   const [saveError, setSaveError] = useState(null);
   const blank = { name: "", gender: "Any", duration: "Monthly", sessionsCount: "", amount: "" };
   const [form, setForm] = useState(blank);
@@ -1363,7 +1511,7 @@ function PaymentPlansPage({ data, refetchData, locationId }) {
         : await supabase.from("payment_plans").update(payload).eq("id", modal.id);
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await refetchData();
+      await (refetchTable ? refetchTable("paymentPlans") : refetchData()); // only this table changed
       setModal(null);
     } finally {
       savingRef.current = false;
@@ -1371,13 +1519,6 @@ function PaymentPlansPage({ data, refetchData, locationId }) {
     }
   };
 
-  const remove = async (id) => {
-    const { error } = await supabase.from("payment_plans").delete().eq("id", id);
-    if (error) { setSaveError(friendlyDeleteError(error, "payment plan")); setConfirmDelete(null); return; }
-    setSaveError(null);
-    await refetchData();
-    setConfirmDelete(null);
-  };
 
   if (!locationId) return <EmptyState icon={Wallet} title="No location selected" message="Add a location first." />;
 
@@ -1409,7 +1550,6 @@ function PaymentPlansPage({ data, refetchData, locationId }) {
                   <td className="sa-mono">{money(p.amount)}</td>
                   <td className="sa-td-actions">
                     <button className="sa-icon-btn" onClick={() => openEdit(p)}><Pencil size={14} /></button>
-                    <button className="sa-icon-btn" onClick={() => setConfirmDelete(p.id)}><Trash2 size={14} /></button>
                   </td>
                 </tr>
               ))}
@@ -1452,18 +1592,14 @@ function PaymentPlansPage({ data, refetchData, locationId }) {
         </Modal>
       )}
 
-      {confirmDelete && (
-        <ConfirmDialog message="Delete this payment plan?" onCancel={() => setConfirmDelete(null)} onConfirm={() => remove(confirmDelete)} />
-      )}
     </div>
   );
 }
 
 /* ============================== BATCHES ============================== */
 
-function BatchesPage({ data, refetchData, locationId }) {
+function BatchesPage({ data, refetchData, refetchTable, locationId }) {
   const [modal, setModal] = useState(null);
-  const [confirmDelete, setConfirmDelete] = useState(null);
   const [saveError, setSaveError] = useState(null);
   const blank = { batchCode: "", name: "" };
   const [form, setForm] = useState(blank);
@@ -1486,7 +1622,7 @@ function BatchesPage({ data, refetchData, locationId }) {
         : await supabase.from("batches").update(payload).eq("id", modal.id);
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await refetchData();
+      await (refetchTable ? refetchTable("batches") : refetchData()); // only this table changed
       setModal(null);
     } finally {
       savingRef.current = false;
@@ -1494,13 +1630,6 @@ function BatchesPage({ data, refetchData, locationId }) {
     }
   };
 
-  const remove = async (id) => {
-    const { error } = await supabase.from("batches").delete().eq("id", id);
-    if (error) { setSaveError(friendlyDeleteError(error, "batch")); setConfirmDelete(null); return; }
-    setSaveError(null);
-    await refetchData();
-    setConfirmDelete(null);
-  };
 
   if (!locationId) return <EmptyState icon={Layers} title="No location selected" message="Add a location first." />;
 
@@ -1526,7 +1655,6 @@ function BatchesPage({ data, refetchData, locationId }) {
                   <td>{data.students.filter((s) => s.batchId === b.id).length}</td>
                   <td className="sa-td-actions">
                     <button className="sa-icon-btn" onClick={() => openEdit(b)}><Pencil size={14} /></button>
-                    <button className="sa-icon-btn" onClick={() => setConfirmDelete(b.id)}><Trash2 size={14} /></button>
                   </td>
                 </tr>
               ))}
@@ -1552,13 +1680,6 @@ function BatchesPage({ data, refetchData, locationId }) {
         </Modal>
       )}
 
-      {confirmDelete && (
-        <ConfirmDialog
-          message="Delete this batch? This also deletes its scheduled sessions, and players in it become unassigned. If any of its sessions has attendance recorded, the batch can't be deleted until that's resolved."
-          onCancel={() => setConfirmDelete(null)}
-          onConfirm={() => remove(confirmDelete)}
-        />
-      )}
     </div>
   );
 }
@@ -1679,7 +1800,8 @@ function StudentForm({ data, locationId, initial, submitting, onCancel, onSave }
 }
 
 function StudentDetail({ data, student, onClose }) {
-  const payments = studentPayments(data, student.id);
+  const historyView = visibleFeeHistory(feeHistoryPayments(data, student.id), data.settings); // same order + date filter as Fee Update
+  const payments = historyView.shown;
   const plan = studentPlan(data, student);
   const months = monthsBetween(shiftMonths(todayISO(), -5), todayISO());
   const status = studentFeeStatus(data, student);
@@ -1717,14 +1839,15 @@ function StudentDetail({ data, student, onClose }) {
         </div>
 
         <h4 className="sa-section-title">Fee History</h4>
+        <FeeHistoryFromNote view={historyView} />
         {payments.length === 0 ? (
-          <p className="sa-muted-text">No payments recorded yet.</p>
+          <p className="sa-muted-text">{historyView.hiddenCount > 0 ? "No payments since that date." : "No payments recorded yet."}</p>
         ) : isPhone ? (
-          <PaymentCards payments={payments} />
+          <PaymentCards payments={payments} attendedFor={(p) => attendedSessionsBetween(data, student.id, p.startDate, p.endDate)} />
         ) : (
           <div className="sa-table-wrap">
             <table className="sa-table sa-table-compact">
-              <thead><tr><th>Date</th><th>Receipt No.</th><th>Mode</th><th>Amount</th><th>Next Due</th><th>Start Date</th><th>End Date</th></tr></thead>
+              <thead><tr><th>Date</th><th>Receipt No.</th><th>Mode</th><th>Amount</th><th>Next Due</th><th>Start Date</th><th>End Date</th><th>Sessions Attended</th></tr></thead>
               <tbody>
                 {payments.map((p) => (
                   <tr key={p.id}>
@@ -1735,6 +1858,7 @@ function StudentDetail({ data, student, onClose }) {
                     <td>{fmtDate(p.nextPaymentDate)}</td>
                     <td>{p.startDate ? fmtDate(p.startDate) : "—"}</td>
                     <td>{p.endDate ? fmtDate(p.endDate) : "—"}</td>
+                    <td className="sa-mono">{attendedSessionsBetween(data, student.id, p.startDate, p.endDate) ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1854,7 +1978,7 @@ function InactivityReviewModal({ data, locationId, onClose, refetchData }) {
   );
 }
 
-function StudentsPage({ data, refetchData, locationId }) {
+function StudentsPage({ data, refetchData, refetchStudents, locationId }) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
   const [modal, setModal] = useState(null);
@@ -1909,7 +2033,7 @@ function StudentsPage({ data, refetchData, locationId }) {
         : await supabase.from("students").update(payload).eq("id", modal.id);
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await refetchData();
+      await (refetchStudents || refetchData)(); // only the players table changed
       setModal(null);
     } finally {
       savingRef.current = false;
@@ -1949,7 +2073,10 @@ function StudentsPage({ data, refetchData, locationId }) {
             <option>All</option><option>Active</option><option>Inactive</option>
           </select>
         </div>
-        <button className="sa-btn sa-btn-ghost" onClick={() => setInactivityReviewOpen(true)}><UserX size={16} /> Review Inactivity</button>
+        {/* Laptop/tablet only — the review list is too wide for a phone screen. */}
+        {!isPhone && (
+          <button className="sa-btn sa-btn-ghost" onClick={() => setInactivityReviewOpen(true)}><UserX size={16} /> Review Inactivity</button>
+        )}
         <button className="sa-btn sa-btn-primary" onClick={openAdd}><Plus size={16} /> Add Player</button>
       </div>
 
@@ -1974,12 +2101,10 @@ function StudentsPage({ data, refetchData, locationId }) {
                     <div className="sa-mcard-row">
                       <div className="sa-mcard-main sa-mcard-sub">{s.jerseyName || "\u2014"} {"\u00b7"} #{s.jerseyNo} {"\u00b7"} {batchName(data, s.batchId)}</div>
                       <div className="sa-mcard-actions sa-mcard-actions-end" onClick={(e) => e.stopPropagation()}>
-                      <CallButton phone={s.phone} name={s.name} />
                       {s.remark && s.remark.trim() && (
                         <button className="sa-icon-btn sa-touch-btn" aria-label="View remark" onClick={() => setRemarkStudentId(s.id)}><MessageSquare size={17} /></button>
                       )}
                       <button className="sa-icon-btn sa-touch-btn" aria-label={`Edit ${s.name}`} onClick={() => openEdit(s)}><Pencil size={17} /></button>
-                      <button className="sa-icon-btn sa-touch-btn" aria-label={`Delete ${s.name}`} onClick={() => setConfirmDelete(s.id)}><Trash2 size={17} /></button>
                       </div>
                     </div>
                   </div>
@@ -2068,7 +2193,7 @@ function StudentsPage({ data, refetchData, locationId }) {
 
 /* ============================== ATTENDANCE ============================== */
 
-function AttendancePage({ data, refetchData, locationId }) {
+function AttendancePage({ data, refetchData, applyAttendanceSaved, locationId }) {
   const [date, setDate] = useState(todayISO());
   const [search, setSearch] = useState("");
   const [batchFilter, setBatchFilter] = useState("ALL");
@@ -2080,14 +2205,32 @@ function AttendancePage({ data, refetchData, locationId }) {
 
   const batchOptions = data.batches.filter((b) => locationId === "ALL" || b.locationId === locationId);
 
-  const sessionFor = (student) =>
-    data.sessions.find((s) => s.locationId === student.locationId && s.date === date && s.batchId === student.batchId);
+  // Lookups for the chosen date, built once per data/date change instead of searching every
+  // session and attendance row for each player. Same "first match" results as before.
+  const dayIndex = useMemo(() => {
+    const sessionByBatch = new Map(); // "locationId|batchId" -> first session that day
+    const idsThatDay = new Set();
+    for (const se of data.sessions) {
+      if (se.date !== date) continue;
+      idsThatDay.add(se.id);
+      const key = `${se.locationId}|${se.batchId}`;
+      if (!sessionByBatch.has(key)) sessionByBatch.set(key, se);
+    }
+    const recordByStudent = new Map(); // "sessionId|studentId" -> first attendance row
+    for (const a of data.attendance) {
+      if (!idsThatDay.has(a.sessionId)) continue;
+      const key = `${a.sessionId}|${a.studentId}`;
+      if (!recordByStudent.has(key)) recordByStudent.set(key, a);
+    }
+    return { sessionByBatch, recordByStudent };
+  }, [data.sessions, data.attendance, date]);
+  const sessionFor = (student) => dayIndex.sessionByBatch.get(`${student.locationId}|${student.batchId}`);
 
   const statusFor = (student) => {
     if (Object.prototype.hasOwnProperty.call(pendingStatus, student.id)) return pendingStatus[student.id];
     const session = sessionFor(student);
     if (!session) return null;
-    const rec = data.attendance.find((a) => a.sessionId === session.id && a.studentId === student.id);
+    const rec = dayIndex.recordByStudent.get(`${session.id}|${student.id}`);
     return rec ? rec.status : null;
   };
 
@@ -2134,14 +2277,18 @@ function AttendancePage({ data, refetchData, locationId }) {
         return;
       }
       sessionId = created.id;
+      // Add the new session to the loaded data now (a reload would include it too).
+      if (applyAttendanceSaved) applyAttendanceSaved({ session: mapSessionRow(created, []), record: null });
     }
 
     // A newer click for this student has already taken over — let that call own the write.
     if (pendingStatusRef.current[student.id] !== status) return;
 
-    const { error } = await supabase
+    const { data: savedRow, error } = await supabase
       .from("attendance")
-      .upsert({ session_id: sessionId, student_id: student.id, status }, { onConflict: "session_id,student_id" });
+      .upsert({ session_id: sessionId, student_id: student.id, status }, { onConflict: "session_id,student_id" })
+      .select()
+      .single();
     if (error) {
       setSaveError(error.message);
       clearPendingIfCurrent(student.id, status);
@@ -2151,7 +2298,9 @@ function AttendancePage({ data, refetchData, locationId }) {
 
     if (pendingStatusRef.current[student.id] !== status) return;
 
-    await refetchData();
+    // The database sent back the stored mark — use it instead of reloading every table.
+    if (applyAttendanceSaved && savedRow) applyAttendanceSaved({ session: null, record: mapAttendanceRow(savedRow) });
+    else await refetchData();
     clearPendingIfCurrent(student.id, status);
   };
 
@@ -2335,7 +2484,9 @@ function CoachesPage({ data, refetchData, locationId }) {
   const savingRef = useRef(false);
   const blank = { name: "", phone: "", email: "", specialty: "", locationIds: locationId === "ALL" ? [] : [locationId] };
 
-  const coaches = data.coaches.filter((c) => locationId === "ALL" || c.locationIds.includes(locationId));
+  const coaches = data.coaches
+    .filter((c) => locationId === "ALL" || c.locationIds.includes(locationId))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
 
   const openAdd = () => setModal({ mode: "add" });
   const openEdit = (c) => setModal({ mode: "edit", id: c.id, initial: c });
@@ -2399,19 +2550,13 @@ function CoachesPage({ data, refetchData, locationId }) {
                 <div className="sa-loc-card-top">
                   <div className="sa-loc-icon" style={{ background: "#0F1B2D" }}><Users size={16} color="#FFB020" /></div>
                   <div className="sa-loc-card-actions">
-                    <button className="sa-icon-btn" onClick={() => openEdit(c)}><Pencil size={14} /></button>
-                    <button className="sa-icon-btn" onClick={() => setConfirmDelete(c.id)}><Trash2 size={14} /></button>
+                    <button className="sa-icon-btn" onClick={() => openEdit(c)} aria-label={`Edit ${c.name}`} title="View or edit details"><Pencil size={14} /></button>
+                    <button className="sa-icon-btn" onClick={() => setConfirmDelete(c.id)} aria-label={`Delete ${c.name}`} title="Delete"><Trash2 size={14} /></button>
                   </div>
                 </div>
+                {/* Tiles show only the name and sessions; phone, email, specialty and locations are
+                    viewed and changed in the Edit Coach form (pencil button). */}
                 <h3>{c.name}</h3>
-                <p className="sa-loc-address">{c.specialty || "General coaching"}</p>
-                <div className="sa-loc-meta">
-                  <span><Phone size={12} /> {c.phone}</span>
-                  <span><Mail size={12} /> {c.email}</span>
-                </div>
-                <div className="sa-loc-meta">
-                  {c.locationIds.map((lid) => <Pill key={lid} tone="neutral">{locationName(data, lid)}</Pill>)}
-                </div>
                 <button className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => setViewSessionsFor(c.id)}>
                   <ClipboardList size={14} /> {sessionCount} assigned sessions
                 </button>
@@ -3137,7 +3282,7 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
       });
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await (refetchPayments || refetchData)();
+      await (refetchPayments ? refetchPayments(selected.id) : refetchData()); // only this player's payments changed
       setPayModal(false);
       setSuccessMessage("Payment recorded successfully.");
     } finally {
@@ -3165,7 +3310,7 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
         .eq("id", editingPayment.payment.id);
       if (error) { setSaveError(error.message); return; }
       setSaveError(null);
-      await (refetchPayments || refetchData)();
+      await (refetchPayments ? refetchPayments(editingPayment.student.id) : refetchData()); // only this player's payments changed
       setEditingPayment(null);
       setSuccessMessage("Payment updated successfully.");
     } finally {
@@ -3173,6 +3318,12 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
       setPaySubmitting(false);
     }
   };
+
+  // Fee History rows for the selected player, and which of them can be edited.
+  const allHistoryPayments = selected ? feeHistoryPayments(data, selected.id) : [];
+  const editableIds = editablePaymentIds(allHistoryPayments); // rules use every payment, even hidden ones
+  const historyView = visibleFeeHistory(allHistoryPayments, data.settings);
+  const historyPayments = historyView.shown;
 
   return (
     <div className="sa-page">
@@ -3220,18 +3371,20 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
           <button className="sa-btn sa-btn-primary" onClick={() => setPayModal(true)}><Plus size={16} /> Record Payment</button>
 
           <h4 className="sa-section-title">Fee History</h4>
-          {studentPayments(data, selected.id).length === 0 ? (
-            <p className="sa-muted-text">No payments recorded yet.</p>
+          <FeeHistoryFromNote view={historyView} />
+          {historyPayments.length === 0 ? (
+            <p className="sa-muted-text">{historyView.hiddenCount > 0 ? "No payments since that date." : "No payments recorded yet."}</p>
           ) : isPhone ? (
             <PaymentCards
-              payments={studentPayments(data, selected.id)}
-              renderActions={(p, i) => (
+              payments={historyPayments}
+              attendedFor={(p) => attendedSessionsBetween(data, selected.id, p.startDate, p.endDate)}
+              renderActions={(p) => (
                 <>
                   {p.comment && p.comment.trim() && (
                     <button className="sa-icon-btn sa-touch-btn" aria-label="View comment" onClick={() => setViewCommentPayment(p)}><MessageSquare size={17} /></button>
                   )}
-                  {i === 0 && (
-                    <button className="sa-icon-btn sa-touch-btn" aria-label="Edit latest payment" onClick={() => setEditingPayment({ student: selected, payment: p })}><Pencil size={17} /></button>
+                  {editableIds.has(p.id) && (
+                    <button className="sa-icon-btn sa-touch-btn" aria-label="Edit payment" onClick={() => setEditingPayment({ student: selected, payment: p })}><Pencil size={17} /></button>
                   )}
                 </>
               )}
@@ -3239,11 +3392,12 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
           ) : (
             <div className="sa-table-wrap">
               <table className="sa-table sa-table-compact">
-                <thead><tr><th>Date</th><th>Receipt No.</th><th>Mode</th><th>Amount</th><th>Next Due</th><th>Start Date</th><th>End Date</th><th></th><th></th></tr></thead>
+                <thead><tr><th>Date</th><th>Receipt No.</th><th>Mode</th><th>Amount</th><th>Next Due</th><th>Start Date</th><th>End Date</th><th>Sessions Attended</th><th></th><th></th></tr></thead>
                 <tbody>
-                  {studentPayments(data, selected.id).map((p, i) => (
+                  {historyPayments.map((p) => (
                     <tr key={p.id}>
                       <td>{fmtDate(p.date)}</td><td className="sa-mono">{p.receiptNo}</td><td>{p.paymentMode || "—"}</td><td className="sa-mono">{money(p.amount)}</td><td>{fmtDate(p.nextPaymentDate)}</td><td>{p.startDate ? fmtDate(p.startDate) : "—"}</td><td>{p.endDate ? fmtDate(p.endDate) : "—"}</td>
+                      <td className="sa-mono">{attendedSessionsBetween(data, selected.id, p.startDate, p.endDate) ?? "—"}</td>
                       <td>
                         {p.comment && p.comment.trim() ? (
                           <button className="sa-icon-btn" title="View comment" onClick={() => setViewCommentPayment(p)}><MessageSquare size={14} /></button>
@@ -3252,8 +3406,8 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
                         )}
                       </td>
                       <td>
-                        {i === 0 ? (
-                          <button className="sa-icon-btn" title="Edit latest payment" onClick={() => setEditingPayment({ student: selected, payment: p })}><Pencil size={14} /></button>
+                        {editableIds.has(p.id) ? (
+                          <button className="sa-icon-btn" title="Edit payment" onClick={() => setEditingPayment({ student: selected, payment: p })}><Pencil size={14} /></button>
                         ) : (
                           <span className="sa-icon-btn-placeholder" />
                         )}
@@ -3370,7 +3524,7 @@ function FeeUpdatePage({ data, refetchData, refetchPayments, locationId }) {
       )}
 
       {editingPayment && (
-        <Modal title={`Update Last Payment \u2014 ${editingPayment.student.name}`} onClose={() => setEditingPayment(null)}>
+        <Modal title={`Update Payment \u2014 ${editingPayment.student.name}`} onClose={() => setEditingPayment(null)}>
           <RecordPaymentForm
             initial={{
               paymentType: editingPayment.payment.paymentType || "Fee",
@@ -3414,6 +3568,9 @@ function CoachAttendancePage({ data, refetchCoachAttendance, locationId }) {
   const [saveError, setSaveError] = useState(null);
   const [pending, setPending] = useState({}); // coachId -> sessions (0 = clearing) while a save is in flight
   const isPhone = useIsPhone();
+  const [filter, setFilter] = useState("all"); // all | marked | unmarked
+  const [search, setSearch] = useState("");
+  const [listRef, listMaxHeight] = useFillRemainingHeight([locationId, date, filter, search, saveError, data.coachAttendanceMissing]);
 
   if (!locationId || locationId === "ALL") {
     return <EmptyState icon={UserCheck} title="Select a location" message="Choose a location from the top bar to mark coach attendance." />;
@@ -3451,18 +3608,36 @@ function CoachAttendancePage({ data, refetchCoachAttendance, locationId }) {
     });
   };
 
-  const sessionSelect = (c) => (
-    <select
-      className="sa-inline-select sa-coach-sessions"
-      value={sessionsFor(c.id) || ""}
-      onChange={(e) => setSessions(c, e.target.value)}
-      aria-label={`Sessions for ${c.name}`}
-      disabled={data.coachAttendanceMissing}
-    >
-      <option value="">{"—"} Not present</option>
-      {COACH_SESSION_OPTIONS.map((n) => <option key={n} value={n}>{n} session{n > 1 ? "s" : ""}</option>)}
-    </select>
+  // Search narrows the list only; the summary strip still counts every coach at the location that day.
+  const q = search.trim().toLowerCase();
+  const shown = coaches.filter((c) =>
+    (!q || c.name.toLowerCase().includes(q)) &&
+    (filter === "all" ? true : filter === "marked" ? sessionsFor(c.id) > 0 : sessionsFor(c.id) === 0)
   );
+
+  // — 1 2 3 tap buttons: one tap saves; "—" clears the coach for this day.
+  const sessionButtons = (c) => {
+    const current = sessionsFor(c.id);
+    return (
+      <div className="sa-coach-seg" role="group" aria-label={`Sessions for ${c.name}`}>
+        {[0, ...COACH_SESSION_OPTIONS].map((n) => (
+          <button
+            key={n}
+            type="button"
+            className={`sa-coach-seg-btn ${current === n && n > 0 ? "sa-coach-seg-active" : ""} ${n === 0 ? "sa-coach-seg-none" : ""}`}
+            aria-pressed={current === n}
+            aria-label={n === 0 ? `${c.name} not present` : `${c.name} ${n} session${n > 1 ? "s" : ""}`}
+            disabled={data.coachAttendanceMissing}
+            onClick={() => { if (current !== n) setSessions(c, n); }}
+          >
+            {n === 0 ? "—" : n}
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  const filterLabel = { all: "All", marked: "Marked", unmarked: "Not marked" };
 
   return (
     <div className="sa-page">
@@ -3471,8 +3646,8 @@ function CoachAttendancePage({ data, refetchCoachAttendance, locationId }) {
       )}
       {saveError && <div className="sa-storage-warning"><AlertCircle size={14} /> {saveError}</div>}
 
-      <div className="sa-page-actions">
-        <div className="sa-search-row">
+      <div className="sa-coach-toolbar">
+        <div className="sa-coach-toolbar-date">
           <DateInput
             className="sa-inline-select sa-att-date"
             value={date}
@@ -3480,56 +3655,64 @@ function CoachAttendancePage({ data, refetchCoachAttendance, locationId }) {
             onChange={(e) => { const v = e.target.value; if (v && v <= today) { setDate(v); setPending({}); } }}
           />
           {date !== today && <button className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => { setDate(today); setPending({}); }}>Today</button>}
+          <div className="sa-search-box sa-coach-search">
+            <Search size={15} />
+            <input placeholder="Search coach name" value={search} onChange={(e) => setSearch(e.target.value)} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} aria-label="Search coach name" />
+            {search && <SearchClearButton onClear={() => setSearch("")} />}
+          </div>
+        </div>
+        <div className="sa-coach-stat" aria-live="polite">
+          <strong>{marked.length}</strong> of {coaches.length} coach{coaches.length === 1 ? "" : "es"} {"·"} <strong>{totalSessions}</strong> session{totalSessions === 1 ? "" : "s"}
         </div>
       </div>
 
-      <div className="sa-card">
-        <div className="sa-card-header">
-          <h3>Updated for {fmtDate(date)}</h3>
-          <span className="sa-muted-text">{marked.length} coach{marked.length === 1 ? "" : "es"} {"·"} {totalSessions} session{totalSessions === 1 ? "" : "s"}</span>
+      {coaches.length > 0 && (
+        <div className="sa-coach-filters" role="tablist">
+          {["all", "marked", "unmarked"].map((f) => (
+            <button
+              key={f}
+              type="button"
+              role="tab"
+              aria-selected={filter === f}
+              className={`sa-coach-filter ${filter === f ? "sa-coach-filter-active" : ""}`}
+              onClick={() => setFilter(f)}
+            >
+              {filterLabel[f]}
+            </button>
+          ))}
         </div>
-        {marked.length === 0 ? (
-          <p className="sa-muted-text">No coaches marked for this day yet.</p>
-        ) : (
-          <div className="sa-coach-summary">
-            {marked.map((c) => (
-              <div key={c.id} className="sa-coach-chip">
-                <span>{c.name}</span>
-                <strong className="sa-mono">{sessionsFor(c.id)}</strong>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      )}
 
       {coaches.length === 0 ? (
         <EmptyState icon={Users} title="No coaches at this location" message="Link coaches to this location on the Coaches page." />
-      ) : isPhone ? (
-        <div className="sa-mcard-list sa-mcard-list-bordered">
-          {coaches.map((c) => (
-            <div key={c.id} className="sa-mcard">
-              <div className="sa-mcard-row">
-                <div className="sa-mcard-main">
-                  <div className="sa-mcard-name">{c.name}</div>
-                </div>
-                {sessionSelect(c)}
-              </div>
-            </div>
-          ))}
-        </div>
+      ) : shown.length === 0 ? (
+        <p className="sa-muted-text">
+          {q ? `No coaches match "${search.trim()}"${filter === "all" ? "" : ` in ${filterLabel[filter]}`}.`
+            : filter === "marked" ? "No coaches marked for this day yet." : "Every coach has been marked for this day."}
+        </p>
       ) : (
-        <div className="sa-table-wrap">
-          <table className="sa-table sa-table-compact">
-            <thead><tr><th>Coach</th><th>No. of Sessions</th></tr></thead>
-            <tbody>
-              {coaches.map((c) => (
-                <tr key={c.id}>
-                  <td className="sa-td-strong">{c.name}</td>
-                  <td>{sessionSelect(c)}</td>
-                </tr>
+        <div className="sa-list-scroll sa-coach-scroll" ref={listRef} style={listMaxHeight ? { maxHeight: listMaxHeight } : undefined}>
+          {isPhone ? (
+            <div className="sa-mcard-list sa-mcard-list-bordered">
+              {shown.map((c) => (
+                <div key={c.id} className={`sa-mcard ${sessionsFor(c.id) > 0 ? "sa-coach-marked" : ""}`}>
+                  <div className="sa-mcard-row">
+                    <div className="sa-mcard-main"><div className="sa-mcard-name">{c.name}</div></div>
+                    {sessionButtons(c)}
+                  </div>
+                </div>
               ))}
-            </tbody>
-          </table>
+            </div>
+          ) : (
+            <div className="sa-coach-grid">
+              {shown.map((c) => (
+                <div key={c.id} className={`sa-coach-tile ${sessionsFor(c.id) > 0 ? "sa-coach-marked" : ""}`}>
+                  <div className="sa-coach-tile-name">{c.name}</div>
+                  {sessionButtons(c)}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -3648,18 +3831,37 @@ function ReportAttendance({ data }) {
     : locationStudents;
   const students = statusFilter === "All" ? searchedStudents : searchedStudents.filter((s) => s.status === statusFilter);
 
+  // One pass over this location's sessions and attendance (rebuilt only when data or location
+  // changes), instead of rescanning all attendance for every player and date. Same results.
+  const attIndex = useMemo(() => {
+    const datesBySession = new Map(); // session id at this location -> its date(s)
+    for (const se of data.sessions) {
+      if (se.locationId !== locationId) continue;
+      let dates = datesBySession.get(se.id);
+      if (!dates) { dates = new Set(); datesBySession.set(se.id, dates); }
+      dates.add(se.date);
+    }
+    const marks = new Map();        // "studentId|date" -> { p, a }
+    const presentByDate = new Map(); // date -> number of "Present" rows
+    for (const a of data.attendance) {
+      const dates = datesBySession.get(a.sessionId);
+      if (!dates) continue;
+      for (const d of dates) {
+        if (a.status === "P") presentByDate.set(d, (presentByDate.get(d) || 0) + 1);
+        if (a.status !== "P" && a.status !== "A") continue;
+        const key = `${a.studentId}|${d}`;
+        const m = marks.get(key) || { p: false, a: false };
+        if (a.status === "P") m.p = true; else m.a = true;
+        marks.set(key, m);
+      }
+    }
+    return { marks, presentByDate };
+  }, [data.sessions, data.attendance, locationId]);
   const attendedOnDate = (studentId, date) => {
-    const sessIds = data.sessions.filter((s) => s.locationId === locationId && s.date === date).map((s) => s.id);
-    return data.attendance.some((a) => a.studentId === studentId && sessIds.includes(a.sessionId) && a.status === "P")
-      ? "P"
-      : data.attendance.some((a) => a.studentId === studentId && sessIds.includes(a.sessionId) && a.status === "A")
-      ? "A"
-      : "\u2013";
+    const m = attIndex.marks.get(`${studentId}|${date}`);
+    return m?.p ? "P" : m?.a ? "A" : "\u2013";
   };
-  const dailyCount = (date) => {
-    const sessIds = data.sessions.filter((s) => s.locationId === locationId && s.date === date).map((s) => s.id);
-    return data.attendance.filter((a) => sessIds.includes(a.sessionId) && a.status === "P").length;
-  };
+  const dailyCount = (date) => attIndex.presentByDate.get(date) || 0;
   const totalForStudent = (studentId) => sessDates.filter((d) => attendedOnDate(studentId, d) === "P").length;
 
   const exportExcel = () => {
@@ -3867,10 +4069,14 @@ function ReportPendingFee({ data }) {
       const last = latestPayment(data, s.id);
       const overdue = !last || !last.nextPaymentDate || last.nextPaymentDate <= asOf;
       const dueAmount = totalOverdueAmountFor(data, s, asOf);
-      const sessionsAfterDue = last
-        ? data.sessions.filter((se) => se.locationId === locationId && se.date >= last.nextPaymentDate && se.date <= asOf)
-            .filter((se) => data.attendance.some((a) => a.sessionId === se.id && a.studentId === s.id && a.status === "P")).length
-        : 0;
+      // Sessions at this location from the due date to asOf that the player attended (same count as
+      // before, via the player's attended-sessions index instead of scanning all attendance).
+      let sessionsAfterDue = 0;
+      if (last) {
+        for (const se of presentSessionsFor(data, s.id).values()) {
+          if (se.locationId === locationId && se.date >= last.nextPaymentDate && se.date <= asOf) sessionsAfterDue += 1;
+        }
+      }
       return { s, overdue, last, dueAmount, sessionsAfterDue };
     })
     // A student with no fee record at all (r.last is null — never made a Fee payment) is always
@@ -4125,6 +4331,120 @@ function AdminForm({ data, initial, submitting, onCancel, onSave }) {
         <button className="sa-btn sa-btn-primary" disabled={!canSubmit || submitting} onClick={() => { if (canSubmit && !submitting) onSave(form); }}>
           {submitting ? "Saving…" : (initial.status === "Invited" || !initial.id ? "Send Invite" : "Save Changes")}
         </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== SETTINGS ============================== */
+// App-wide settings, changed by Super Admins only (the database also refuses changes from anyone else).
+
+function SettingsPage({ data, currentRole, refetchSettings }) {
+  const current = data.settings || DEFAULT_SETTINGS;
+  const [form, setForm] = useState(() => ({
+    feeHistoryFrom: current.feeHistoryFrom,
+    termStart: current.termStart,
+    termEnd: current.termEnd,
+    dashboardStartMonth: current.dashboardStartMonth || (current.termStart ? monthKey(current.termStart) : ""),
+  }));
+  // Dashboard start month follows the term start until someone sets it themselves.
+  const [dashTouched, setDashTouched] = useState(!!current.dashboardStartMonth);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  if (currentRole !== "super_admin") {
+    return <EmptyState icon={SettingsIcon} title="Not available" message="Only Super Admins can change settings." />;
+  }
+
+  const set = (patch) => { setForm((f) => ({ ...f, ...patch })); setSaved(false); setError(null); };
+  const onTermStart = (v) => {
+    const patch = { termStart: v };
+    if (!dashTouched) patch.dashboardStartMonth = v ? monthKey(v) : "";
+    set(patch);
+  };
+  const termError = form.termStart && form.termEnd && form.termEnd < form.termStart ? "Term end date must be on or after the start date." : null;
+
+  const save = async () => {
+    if (termError) return;
+    setSaving(true);
+    const { error: err } = await supabase.from("app_settings").upsert({
+      id: 1,
+      fee_history_from: form.feeHistoryFrom || null,
+      term_start: form.termStart || null,
+      term_end: form.termEnd || null,
+      dashboard_start_month: form.dashboardStartMonth ? `${form.dashboardStartMonth}-01` : null,
+    });
+    setSaving(false);
+    if (err) { setError(err.message); return; }
+    await refetchSettings();
+    setSaved(true);
+  };
+
+  const effectiveDash = form.dashboardStartMonth || DASHBOARD_TREND_MIN_MONTH;
+
+  return (
+    <div className="sa-page">
+      {data.settingsMissing && (
+        <div className="sa-storage-warning"><AlertCircle size={14} /> Settings aren't set up in the database yet. Run supabase/migrations_manual/create_app_settings.sql in the Supabase SQL Editor, then reload.</div>
+      )}
+      {error && <div className="sa-storage-warning"><AlertCircle size={14} /> {error}</div>}
+
+      <div className="sa-card sa-settings-card">
+        <div className="sa-card-header"><h3>Fee History</h3></div>
+        <Field label="Show payments from">
+          <div className="sa-settings-row">
+            <DateInput value={form.feeHistoryFrom} max={todayISO()} placeholder={"Not set \u2014 show all"} onChange={(e) => set({ feeHistoryFrom: e.target.value })} />
+            {form.feeHistoryFrom && <button type="button" className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => set({ feeHistoryFrom: "" })}>Clear</button>}
+          </div>
+        </Field>
+        <p className="sa-settings-help">
+          Fee History (Fee Update and the player record) hides payments made before this date. Fee status,
+          the Pending and Paid lists, the Dashboard and Reports still use every payment. Leave empty to show all.
+        </p>
+      </div>
+
+      <div className="sa-card sa-settings-card">
+        <div className="sa-card-header"><h3>Current Term</h3></div>
+        <div className="sa-settings-grid">
+          <Field label="Term start date">
+            <DateInput value={form.termStart} placeholder="Not set" onChange={(e) => onTermStart(e.target.value)} />
+          </Field>
+          <Field label="Term end date">
+            <DateInput value={form.termEnd} min={form.termStart || undefined} placeholder="Not set" onChange={(e) => set({ termEnd: e.target.value })} />
+          </Field>
+        </div>
+        {termError && <p className="sa-settings-error">{termError}</p>}
+        <p className="sa-settings-help">The term start also sets the Dashboard start month below, unless you change that yourself.</p>
+      </div>
+
+      <div className="sa-card sa-settings-card">
+        <div className="sa-card-header"><h3>Dashboard</h3></div>
+        <Field label="Dashboard start month">
+          <div className="sa-settings-row">
+            <input
+              type="month"
+              value={form.dashboardStartMonth}
+              max={monthKey(todayISO())}
+              onChange={(e) => { setDashTouched(true); set({ dashboardStartMonth: e.target.value }); }}
+            />
+            {dashTouched && form.termStart && (
+              <button type="button" className="sa-btn sa-btn-ghost sa-btn-sm" onClick={() => { setDashTouched(false); set({ dashboardStartMonth: monthKey(form.termStart) }); }}>Use term start</button>
+            )}
+          </div>
+        </Field>
+        <p className="sa-settings-help">
+          The Dashboard's month picker won't go earlier than {fmtMonth(`${effectiveDash}-01`)}
+          {form.dashboardStartMonth ? "" : " (built-in default)"}. It always covers at most the last 12 months.
+        </p>
+      </div>
+
+      <div className="sa-settings-actions">
+        <button className="sa-btn sa-btn-primary" onClick={save} disabled={saving || !!termError || data.settingsMissing}>
+          {saving ? "Saving…" : "Save Settings"}
+        </button>
+        {saved && <span className="sa-settings-saved"><Check size={14} /> Saved</span>}
+        {current.updatedAt && <span className="sa-muted-text">Last changed {fmtDate(String(current.updatedAt).slice(0, 10))}</span>}
       </div>
     </div>
   );
@@ -4448,10 +4768,67 @@ export default function App() {
 
   // Lighter refresh for Fee Update saves: only the payments table changes there.
   // Falls back to a full reload if the partial one fails.
-  const refetchPayments = useCallback(async () => {
+  // Fee Update saves. With a studentId, reloads only that player's payments and swaps them in
+  // (kept in id order, as a full reload would give); without one, reloads the whole payments table.
+  const refetchPayments = useCallback(async (studentId) => {
     try {
-      const payments = await loadPayments();
-      setData((prev) => (prev ? { ...prev, payments } : prev));
+      if (studentId) {
+        const fresh = await loadStudentPayments(studentId);
+        setData((prev) => {
+          if (!prev) return prev;
+          let payments = prev.payments.filter((p) => p.studentId !== studentId);
+          for (const p of fresh) payments = upsertById(payments, p);
+          return { ...prev, payments };
+        });
+      } else {
+        const payments = await loadPayments();
+        setData((prev) => (prev ? { ...prev, payments } : prev));
+      }
+      setDataError(null);
+    } catch {
+      await refetchData();
+    }
+  }, [refetchData]);
+
+  // Locations / Payment Plans / Batches add or edit: reload only that table.
+  const refetchTable = useCallback(async (key) => {
+    try {
+      const rows = await loadSingleTable(key);
+      setData((prev) => (prev ? { ...prev, [key]: rows } : prev));
+      setDataError(null);
+    } catch {
+      await refetchData();
+    }
+  }, [refetchData]);
+
+  // Players page add/edit: only the players table changes, so reload just that.
+  const refetchStudents = useCallback(async () => {
+    try {
+      const students = await loadStudents();
+      setData((prev) => (prev ? { ...prev, students } : prev));
+      setDataError(null);
+    } catch {
+      await refetchData();
+    }
+  }, [refetchData]);
+
+  // Attendance taps: the database sends back the saved mark (and any session it had to create);
+  // put those rows straight into the loaded data instead of reloading every table.
+  const applyAttendanceSaved = useCallback(({ session, record }) => {
+    setData((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev };
+      if (session) next.sessions = upsertById(prev.sessions, session);
+      if (record) next.attendance = upsertById(prev.attendance, record);
+      return next;
+    });
+  }, []);
+
+  // Settings page saves: reload just the settings row.
+  const refetchSettings = useCallback(async () => {
+    try {
+      const res = await loadAppSettings();
+      setData((prev) => (prev ? { ...prev, settings: res.settings, settingsMissing: res.missing } : prev));
       setDataError(null);
     } catch {
       await refetchData();
@@ -4645,17 +5022,18 @@ export default function App() {
             <div className="sa-storage-warning"><AlertCircle size={14} /> {dataError}</div>
           )}
           {activeView === "dashboard" && <DashboardPage data={data} dashLocationId={dashLocationId} setDashLocationId={setDashLocationId} />}
-          {activeView === "locations" && <LocationsPage data={data} refetchData={refetchData} />}
-          {activeView === "paymentPlans" && <PaymentPlansPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {activeView === "batches" && <BatchesPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {activeView === "students" && <StudentsPage data={data} refetchData={refetchData} locationId={locationId} />}
-          {activeView === "attendance" && <AttendancePage data={data} refetchData={refetchData} locationId={locationId} />}
+          {activeView === "locations" && <LocationsPage data={data} refetchData={refetchData} refetchTable={refetchTable} />}
+          {activeView === "paymentPlans" && <PaymentPlansPage data={data} refetchData={refetchData} refetchTable={refetchTable} locationId={locationId} />}
+          {activeView === "batches" && <BatchesPage data={data} refetchData={refetchData} refetchTable={refetchTable} locationId={locationId} />}
+          {activeView === "students" && <StudentsPage data={data} refetchData={refetchData} refetchStudents={refetchStudents} locationId={locationId} />}
+          {activeView === "attendance" && <AttendancePage data={data} refetchData={refetchData} applyAttendanceSaved={applyAttendanceSaved} locationId={locationId} />}
           {activeView === "coaches" && <CoachesPage data={data} refetchData={refetchData} locationId={locationId} />}
           {activeView === "schedules" && <SchedulesPage data={data} refetchData={refetchData} locationId={locationId} />}
           {activeView === "feeUpdate" && <FeeUpdatePage data={data} refetchData={refetchData} refetchPayments={refetchPayments} locationId={locationId} />}
           {activeView === "coachAttendance" && <CoachAttendancePage data={data} refetchCoachAttendance={refetchCoachAttendance} locationId={locationId} />}
           {activeView === "reports" && <ReportsPage data={data} />}
           {activeView === "manageAdmins" && <ManageAdminsPage currentRole={currentRole} />}
+          {activeView === "settings" && <SettingsPage data={data} currentRole={currentRole} refetchSettings={refetchSettings} />}
         </div>
       </div>
       {toast && <div className="sa-toast" role="status">{toast}</div>}
@@ -5049,11 +5427,39 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
 .sa-att-toggle-lg { flex-shrink: 0; }
 .sa-att-toggle-lg .sa-att-toggle-btn { width: 52px; height: 44px; padding: 0; }
 
+/* ---------- Settings ---------- */
+.sa-settings-card { max-width: 720px; }
+.sa-settings-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sa-settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.sa-settings-help { font-size: 12.5px; color: var(--muted); margin: 8px 0 0; line-height: 1.5; }
+.sa-settings-error { font-size: 12.5px; color: var(--red); margin: 6px 0 0; }
+.sa-settings-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; max-width: 720px; }
+.sa-settings-saved { display: inline-flex; align-items: center; gap: 4px; color: #0F766E; font-size: 13px; font-weight: 600; }
+.sa-history-from-note { font-size: 12px; color: var(--muted); margin: -4px 0 8px; }
+
 /* ---------- Coach Attendance ---------- */
-.sa-coach-summary { display: flex; flex-wrap: wrap; gap: 8px; }
-.sa-coach-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
-.sa-coach-chip strong { background: var(--navy); color: var(--amber); border-radius: 6px; padding: 1px 7px; font-size: 12px; }
-.sa-coach-sessions { min-width: 150px; padding: 6px 8px; font-size: 13px; }
+.sa-coach-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.sa-coach-toolbar-date { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.sa-coach-search { width: 260px; max-width: 100%; }
+.sa-coach-stat { background: #CCFBF1; color: #0F766E; border-radius: 8px; padding: 8px 12px; font-size: 13px; white-space: nowrap; }
+.sa-coach-stat strong { font-weight: 800; }
+.sa-coach-filters { display: flex; gap: 6px; }
+.sa-coach-filter { border: 1px solid var(--border); background: var(--card); color: var(--muted); border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.sa-coach-filter-active { background: var(--navy); border-color: var(--navy); color: #fff; }
+.sa-coach-scroll { overflow-y: auto; }
+.sa-coach-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }
+.sa-coach-tile { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.sa-coach-tile-name { font-size: 14px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.sa-coach-marked { background: #F0FDFA; }
+.sa-coach-tile.sa-coach-marked { border-color: var(--teal); }
+.sa-coach-seg { display: inline-flex; align-self: flex-start; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; flex-shrink: 0; background: var(--card); }
+.sa-coach-seg-btn { width: 40px; height: 34px; border: none; border-left: 1px solid var(--border); background: transparent; color: var(--ink); font-size: 14px; font-weight: 700; cursor: pointer; font-family: inherit; }
+.sa-coach-seg-btn:first-child { border-left: none; }
+.sa-coach-seg-btn:hover:not(:disabled) { background: var(--bg); }
+.sa-coach-seg-none { color: var(--muted); }
+.sa-coach-seg-btn.sa-coach-seg-active { background: #0F766E; color: #fff; }
+.sa-coach-seg-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+@media (pointer: coarse) { .sa-coach-seg-btn { width: 44px; height: 44px; } }
 .sa-row-subtotal td { background: var(--bg); font-weight: 700; }
 .sa-row-total td { background: var(--navy); color: #fff; font-weight: 700; }
 
@@ -5147,9 +5553,10 @@ th.sa-th-center, td.sa-th-center { text-align: center; }
   .sa-student-detail-grid div { padding: 6px 8px; gap: 1px; }
   .sa-student-detail-grid span { font-size: 9.5px; letter-spacing: 0.3px; }
   .sa-student-detail-grid strong { font-size: 12.5px; overflow-wrap: anywhere; }
-  /* Coach Attendance */
-  .sa-coach-sessions { min-width: 0; width: 150px; height: 44px; flex-shrink: 0; }
-  .sa-coach-chip { font-size: 13px; }
+  /* Coach Attendance: full finger-size tap buttons */
+  .sa-coach-seg-btn { width: 44px; height: 44px; font-size: 15px; }
+  .sa-coach-stat { padding: 8px 10px; }
+  .sa-coach-search { width: 100%; }
   /* Dashboard */
   .sa-dash-phone-filter { display: flex; align-items: center; gap: 8px; color: var(--muted); }
   .sa-dash-phone-filter select { flex: 1; min-width: 0; height: 40px; }
